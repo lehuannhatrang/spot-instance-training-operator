@@ -209,6 +209,13 @@ func (r *SpotInstanceJobReconciler) createJobReplica(ctx context.Context, spotIn
 		Spec: spotInstanceJob.Spec.JobTemplate.Spec,
 	}
 
+	// Ensure pod template has the SpotInstanceJob label
+	if job.Spec.Template.Labels == nil {
+		job.Spec.Template.Labels = make(map[string]string)
+	}
+	job.Spec.Template.Labels[spotInstanceJobLabel] = spotInstanceJob.Name
+	job.Spec.Template.Labels[jobReplicaLabel] = fmt.Sprintf("%d", replicaIndex)
+
 	// Set owner reference
 	if err := controllerutil.SetControllerReference(spotInstanceJob, job, r.Scheme); err != nil {
 		return err
@@ -220,6 +227,7 @@ func (r *SpotInstanceJobReconciler) createJobReplica(ctx context.Context, spotIn
 		return err
 	}
 
+	logger.Info("Created job with labels", "jobName", jobName, "labels", job.Spec.Template.Labels)
 	return nil
 }
 
@@ -494,9 +502,9 @@ func (r *SpotInstanceJobReconciler) handlePreemption(ctx context.Context, spotIn
 			}
 		}
 
-		// If instance is TERMINATED, remove the node from cluster
-		if instance.Status == "TERMINATED" || instance.Status == "STOPPED" {
-			logger.Info("Instance is terminated, cleaning up node", "instance", instance.Name)
+		// If instance is STOPPING, TERMINATED, or STOPPED, remove the node from cluster
+		if instance.Status == "STOPPING" || instance.Status == "TERMINATED" || instance.Status == "STOPPED" {
+			logger.Info("Instance is terminating/terminated, cleaning up node", "instance", instance.Name, "status", instance.Status)
 			if err := r.cleanupNode(ctx, instance.Name); err != nil {
 				logger.Error(err, "Failed to cleanup node", "instance", instance.Name)
 			}
@@ -561,29 +569,52 @@ func (r *SpotInstanceJobReconciler) handlePreemptedInstance(ctx context.Context,
 
 // findJobsOnNode finds jobs running on a specific node
 func (r *SpotInstanceJobReconciler) findJobsOnNode(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, nodeName string) ([]string, error) {
-	// List all pods for this SpotInstanceJob
+	logger := log.FromContext(ctx)
+
+	// List all pods in the namespace
 	podList := &corev1.PodList{}
-	labelSelector := client.MatchingLabels{
-		"job-name": "", // Jobs create pods with job-name label
-	}
-	if err := r.List(ctx, podList, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err != nil {
+	if err := r.List(ctx, podList, client.InNamespace(spotInstanceJob.Namespace)); err != nil {
 		return nil, err
 	}
 
-	jobNames := []string{}
+	logger.Info("Searching for jobs on node", "node", nodeName, "totalPods", len(podList.Items))
+
+	jobNamesSet := make(map[string]bool)
 	for _, pod := range podList.Items {
-		// Check if pod belongs to a job of this SpotInstanceJob
-		jobName, ok := pod.Labels["job-name"]
-		if !ok {
+		// Check if pod is on the target node
+		if pod.Spec.NodeName != nodeName {
+			continue
+		}
+
+		logger.Info("Found pod on node", "pod", pod.Name, "node", nodeName, "labels", pod.Labels)
+
+		// Check if pod belongs to a job - try both label formats
+		jobName := ""
+		if name, ok := pod.Labels["job-name"]; ok {
+			jobName = name
+		} else if name, ok := pod.Labels["batch.kubernetes.io/job-name"]; ok {
+			jobName = name
+		} else {
+			logger.Info("Pod has no job-name label", "pod", pod.Name)
 			continue
 		}
 
 		// Check if this job belongs to our SpotInstanceJob
-		if pod.Spec.NodeName == nodeName {
-			jobNames = append(jobNames, jobName)
+		if jobLabel, ok := pod.Labels[spotInstanceJobLabel]; ok && jobLabel == spotInstanceJob.Name {
+			jobNamesSet[jobName] = true
+			logger.Info("Found job on preempted node", "job", jobName, "pod", pod.Name, "node", nodeName)
+		} else {
+			logger.Info("Pod does not belong to this SpotInstanceJob", "pod", pod.Name, "jobName", jobName)
 		}
 	}
 
+	// Convert set to slice
+	jobNames := []string{}
+	for jobName := range jobNamesSet {
+		jobNames = append(jobNames, jobName)
+	}
+
+	logger.Info("Jobs found on node", "node", nodeName, "count", len(jobNames), "jobs", jobNames)
 	return jobNames, nil
 }
 
