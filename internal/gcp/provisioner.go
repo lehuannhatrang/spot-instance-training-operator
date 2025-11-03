@@ -103,12 +103,30 @@ func (p *Provisioner) ProvisionSpotInstance(ctx context.Context, vmSpec *trainin
 	}
 
 	// Add startup script if provided
-	if vmSpec.StartupScript != "" {
+	startupScript := vmSpec.StartupScript
+
+	// If kubeadm join config is provided, append join command to startup script
+	if vmSpec.KubeadmJoinConfig != nil &&
+		vmSpec.KubeadmJoinConfig.ControlPlaneEndpoint != "" &&
+		vmSpec.KubeadmJoinConfig.CACertHash != "" {
+		// Note: Token should be retrieved from secret, but for startup script we need it here
+		// This is a simplified version - in production, you'd handle token more securely
+		joinCmd := "\n\n# Join Kubernetes cluster\n"
+		joinCmd += "while ! systemctl is-active --quiet kubelet; do\n"
+		joinCmd += "  echo 'Waiting for kubelet...'\n"
+		joinCmd += "  sleep 5\n"
+		joinCmd += "done\n"
+		joinCmd += "echo 'Joining cluster...'\n"
+		// The actual join will be handled by SSH after provisioning
+		startupScript += joinCmd
+	}
+
+	if startupScript != "" {
 		instance.Metadata = &compute.Metadata{
 			Items: []*compute.MetadataItems{
 				{
 					Key:   "startup-script",
-					Value: &vmSpec.StartupScript,
+					Value: &startupScript,
 				},
 			},
 		}

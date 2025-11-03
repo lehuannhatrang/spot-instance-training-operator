@@ -1,0 +1,20 @@
+apiVersion: training.training.dcnlab.com/v1alpha1
+kind: SpotInstanceVM
+metadata:
+  name: testla-t4-1-gpu
+spec:
+  vmImage: "projects/criu-with-gpu-dcn/global/images/image-ubuntu-2404-gpu-580-v2"
+  gpu:
+    type: "nvidia-tesla-t4"
+    count: 1
+  gcp:
+    project: "criu-with-gpu-dcn"
+    zone: "asia-northeast3-c"
+    machineType: "n1-standard-4"
+    diskSizeGB: 100
+  
+  # Note: Nodes will auto-join cluster if 'kubeadm-join-token' secret exists in the namespace
+  # Create it with: kubectl create secret generic kubeadm-join-token \
+  #   --from-literal=token=<token> \
+  #   --from-literal=ca-cert-hash=<hash> \
+  #   --from-literal=control-plane-endpoint=<endpoint>

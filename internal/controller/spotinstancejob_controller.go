@@ -24,6 +24,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	trainingv1alpha1 "github.com/dcnlab/spot-instance-training-operator/api/v1alpha1"
+	"github.com/dcnlab/spot-instance-training-operator/internal/gcp"
 )
 
 const (
@@ -50,6 +52,8 @@ type SpotInstanceJobReconciler struct {
 // +kubebuilder:rbac:groups=training.training.dcnlab.com,resources=spotinstancejobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=training.training.dcnlab.com,resources=spotinstancejobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=training.training.dcnlab.com,resources=spotinstancejobs/finalizers,verbs=update
+// +kubebuilder:rbac:groups=training.training.dcnlab.com,resources=spotinstancevms,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=training.training.dcnlab.com,resources=spotinstancevms/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
@@ -130,9 +134,28 @@ func (r *SpotInstanceJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Create missing jobs
-	if int32(len(jobList.Items)) < replicas {
-		needed := replicas - int32(len(jobList.Items))
+	// Check if we need to provision more resources
+	needed := replicas - int32(len(jobList.Items))
+	if needed > 0 {
+		// Check if there are enough GPU resources
+		hasResources, err := r.checkResourceAvailability(ctx, spotInstanceVM, needed)
+		if err != nil {
+			logger.Error(err, "Failed to check resource availability")
+			return ctrl.Result{}, err
+		}
+
+		// If not enough resources, provision new spot instances
+		if !hasResources {
+			logger.Info("Not enough resources, provisioning spot instances", "needed", needed)
+			if err := r.provisionSpotInstances(ctx, spotInstanceJob, spotInstanceVM, needed); err != nil {
+				logger.Error(err, "Failed to provision spot instances")
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+			}
+			// Requeue to wait for nodes to be ready
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
+		// Create missing jobs
 		for i := int32(0); i < needed; i++ {
 			jobName := fmt.Sprintf("%s-replica-%d-%d", spotInstanceJob.Name, len(jobList.Items)+int(i), time.Now().Unix())
 			if err := r.createJobReplica(ctx, spotInstanceJob, jobName, int32(len(jobList.Items)+int(i))); err != nil {
@@ -208,7 +231,7 @@ func (r *SpotInstanceJobReconciler) handleDeletion(ctx context.Context, spotInst
 }
 
 // checkResourceAvailability checks if there are enough resources to schedule jobs
-func (r *SpotInstanceJobReconciler) checkResourceAvailability(ctx context.Context, spotInstanceVM *trainingv1alpha1.SpotInstanceVM) (bool, error) {
+func (r *SpotInstanceJobReconciler) checkResourceAvailability(ctx context.Context, spotInstanceVM *trainingv1alpha1.SpotInstanceVM, needed int32) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	// List all nodes
@@ -220,23 +243,156 @@ func (r *SpotInstanceJobReconciler) checkResourceAvailability(ctx context.Contex
 
 	// Check for GPU availability
 	if spotInstanceVM.Spec.GPU != nil {
+		availableNodes := int32(0)
+		requiredGPUs := spotInstanceVM.Spec.GPU.Count
+
 		for _, node := range nodeList.Items {
+			// Skip nodes that are not ready
+			if !isNodeReady(&node) {
+				continue
+			}
+
 			// Check if node has the required GPU
-			if gpuCapacity, ok := node.Status.Capacity["nvidia.com/gpu"]; ok {
-				if gpuCapacity.Value() >= int64(spotInstanceVM.Spec.GPU.Count) {
-					// Check if GPU is available (not fully allocated)
-					if gpuAllocatable, ok := node.Status.Allocatable["nvidia.com/gpu"]; ok {
-						if gpuAllocatable.Value() >= int64(spotInstanceVM.Spec.GPU.Count) {
-							return true, nil
-						}
-					}
+			gpuAllocatable, ok := node.Status.Allocatable["nvidia.com/gpu"]
+			if !ok {
+				continue
+			}
+
+			if gpuAllocatable.Cmp(resource.MustParse(fmt.Sprintf("%d", requiredGPUs))) >= 0 {
+				availableNodes++
+				if availableNodes >= needed {
+					return true, nil
 				}
 			}
 		}
+		logger.Info("Not enough GPU nodes available", "available", availableNodes, "needed", needed)
 		return false, nil
 	}
 
 	return true, nil
+}
+
+// isNodeReady checks if a node is ready
+func isNodeReady(node *corev1.Node) bool {
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// provisionSpotInstances provisions new GCP spot instances
+func (r *SpotInstanceJobReconciler) provisionSpotInstances(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, spotInstanceVM *trainingv1alpha1.SpotInstanceVM, count int32) error {
+	logger := log.FromContext(ctx)
+
+	// Get GCP credentials from secret
+	credentialsSecret := &corev1.Secret{}
+	secretKey := types.NamespacedName{
+		Name:      spotInstanceJob.Spec.GCPCredentialsSecretRef.Name,
+		Namespace: spotInstanceJob.Spec.GCPCredentialsSecretRef.Namespace,
+	}
+	if err := r.Get(ctx, secretKey, credentialsSecret); err != nil {
+		return fmt.Errorf("failed to get GCP credentials secret: %w", err)
+	}
+
+	credentialsJSON, ok := credentialsSecret.Data["credentials.json"]
+	if !ok {
+		return fmt.Errorf("credentials.json not found in secret")
+	}
+
+	// Create GCP provisioner
+	provisioner, err := gcp.NewProvisioner(ctx, credentialsJSON, spotInstanceVM.Spec.GCP.Project)
+	if err != nil {
+		return fmt.Errorf("failed to create GCP provisioner: %w", err)
+	}
+
+	// Get kubeadm token from secret
+	// Try to get from kubeadmJoinConfig first, otherwise look for standard secret name
+	secretName := "kubeadm-join-token"
+	if spotInstanceVM.Spec.KubeadmJoinConfig != nil && spotInstanceVM.Spec.KubeadmJoinConfig.TokenSecretRef != "" {
+		secretName = spotInstanceVM.Spec.KubeadmJoinConfig.TokenSecretRef
+	}
+
+	kubeadmToken := ""
+	caCertHash := ""
+	controlPlaneEndpoint := ""
+
+	tokenSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      secretName,
+		Namespace: spotInstanceVM.Namespace,
+	}, tokenSecret); err != nil {
+		logger.Info("kubeadm join token not found, nodes will not auto-join cluster", "secret", secretName)
+	} else {
+		kubeadmToken = string(tokenSecret.Data["token"])
+		caCertHash = string(tokenSecret.Data["ca-cert-hash"])
+		controlPlaneEndpoint = string(tokenSecret.Data["control-plane-endpoint"])
+		logger.Info("Found kubeadm join credentials", "secret", secretName)
+	}
+
+	// Provision instances
+	for i := int32(0); i < count; i++ {
+		instanceName := fmt.Sprintf("%s-%s-%d-%d", spotInstanceJob.Name, spotInstanceVM.Name, i, time.Now().Unix())
+		logger.Info("Provisioning spot instance", "name", instanceName)
+
+		// Clone the VM spec and inject kubeadm join command if we have credentials
+		vmSpec := spotInstanceVM.Spec.DeepCopy()
+		if kubeadmToken != "" && controlPlaneEndpoint != "" && caCertHash != "" {
+			joinCmd := gcp.GenerateKubeadmJoinCommand(
+				controlPlaneEndpoint,
+				kubeadmToken,
+				caCertHash,
+			)
+			// Append join command to startup script
+			vmSpec.StartupScript += fmt.Sprintf("\n\n# Auto-join Kubernetes cluster\n%s\n", joinCmd)
+			logger.Info("Added kubeadm join to startup script", "endpoint", controlPlaneEndpoint)
+		}
+
+		instance, err := provisioner.ProvisionSpotInstance(ctx, vmSpec, instanceName)
+		if err != nil {
+			logger.Error(err, "Failed to provision spot instance", "name", instanceName)
+			return err
+		}
+
+		logger.Info("Spot instance provisioned", "name", instanceName, "instanceID", instance.Id)
+
+		// Update SpotInstanceVM status
+		if err := r.updateVMStatus(ctx, spotInstanceVM, instance); err != nil {
+			logger.Error(err, "Failed to update SpotInstanceVM status")
+		}
+
+		// Node will auto-join via startup script
+		if kubeadmToken != "" {
+			logger.Info("Node will auto-join cluster via startup script", "instance", instanceName)
+		}
+	}
+
+	return nil
+}
+
+// updateVMStatus updates the SpotInstanceVM status with provisioned instance info
+func (r *SpotInstanceJobReconciler) updateVMStatus(ctx context.Context, spotInstanceVM *trainingv1alpha1.SpotInstanceVM, instance interface{}) error {
+	// Get the latest version of SpotInstanceVM
+	latest := &trainingv1alpha1.SpotInstanceVM{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      spotInstanceVM.Name,
+		Namespace: spotInstanceVM.Namespace,
+	}, latest); err != nil {
+		return err
+	}
+
+	// Add instance to status (simplified - would need proper GCP instance type handling)
+	now := metav1.Now()
+	vmStatus := trainingv1alpha1.VMInstanceStatus{
+		Name:         fmt.Sprintf("instance-%d", time.Now().Unix()),
+		State:        "PROVISIONING",
+		CreationTime: &now,
+	}
+
+	latest.Status.ProvisionedInstances = append(latest.Status.ProvisionedInstances, vmStatus)
+
+	return r.Status().Update(ctx, latest)
 }
 
 // SetupWithManager sets up the controller with the Manager.

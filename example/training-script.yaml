@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: train-script
+data:
+  train.py: |
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    # Single-thread mode
+    torch.set_num_threads(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    # Small GPT model for training
+    config = GPT2Config(
+        vocab_size=50257,
+        n_layer=4,
+        n_head=4,
+        n_embd=256,
+    )
+    model = GPT2LMHeadModel(config).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=5e-4)
+    loss_fn = nn.CrossEntropyLoss()
+
+    # Dummy dataset (random token sequences)
+    batch_size, seq_len = 8, 128
+    vocab_size = config.vocab_size
+
+    import time
+    duration_hours = 4
+    end_time = time.time() + duration_hours * 3600
+    step = 0
+
+    while time.time() < end_time:
+        inputs = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        labels = inputs.clone()
+
+        outputs = model(inputs, labels=labels)
+        loss = outputs.loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        step += 1
+        if step % 10 == 0:
+            print(f"Step {step} | Loss {loss.item():.4f}")
