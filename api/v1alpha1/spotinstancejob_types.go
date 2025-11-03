@@ -35,6 +35,10 @@ type CheckpointConfig struct {
 	// +required
 	CheckpointInterval metav1.Duration `json:"checkpointInterval"`
 
+	// CheckpointRepoCredentialRef is a reference to the secret containing credentials for the checkpoint image repo
+	// +optional
+	CheckpointRepoCredentialRef *corev1.SecretReference `json:"checkpointRepoCredentialRef,omitempty"`
+
 	// CheckpointStorage defines the storage configuration for checkpoints
 	// +optional
 	CheckpointStorage *CheckpointStorageConfig `json:"checkpointStorage,omitempty"`

@@ -10,8 +10,12 @@ spec:
     name: gcp-credentials
     namespace: default
   checkpointConfig:
-    checkpointImageRepo: "gcr.io/my-project/checkpoints"
+    checkpointImageRepo: "docker.io/lehuannhatrang/gpu-checkpoints"
     checkpointInterval: "30m"
+    # Optional: credentials for pushing checkpoint images
+    # checkpointRepoCredentialRef:
+    #   name: "checkpoint-repo-credentials"
+    #   namespace: "default"
   jobTemplate:
     spec:
       template:

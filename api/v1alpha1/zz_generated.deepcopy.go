@@ -21,7 +21,8 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -29,6 +30,11 @@ import (
 func (in *CheckpointConfig) DeepCopyInto(out *CheckpointConfig) {
 	*out = *in
 	out.CheckpointInterval = in.CheckpointInterval
+	if in.CheckpointRepoCredentialRef != nil {
+		in, out := &in.CheckpointRepoCredentialRef, &out.CheckpointRepoCredentialRef
+		*out = new(v1.SecretReference)
+		**out = **in
+	}
 	if in.CheckpointStorage != nil {
 		in, out := &in.CheckpointStorage, &out.CheckpointStorage
 		*out = new(CheckpointStorageConfig)
@@ -214,7 +220,7 @@ func (in *SpotInstanceJobStatus) DeepCopyInto(out *SpotInstanceJobStatus) {
 	*out = *in
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
-		*out = make([]v1.Condition, len(*in))
+		*out = make([]metav1.Condition, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
@@ -330,7 +336,7 @@ func (in *SpotInstanceVMStatus) DeepCopyInto(out *SpotInstanceVMStatus) {
 	*out = *in
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
-		*out = make([]v1.Condition, len(*in))
+		*out = make([]metav1.Condition, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
