@@ -65,6 +65,8 @@ type SpotInstanceJobSpec struct {
 
 	// JobTemplate is the template for the Job to be created
 	// +required
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Schemaless
 	JobTemplate batchv1.JobTemplateSpec `json:"jobTemplate"`
 
 	// CheckpointConfig defines checkpoint configuration
