@@ -8,6 +8,14 @@ rules:
   - ""
   resources:
   - nodes
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   - secrets
   verbs:

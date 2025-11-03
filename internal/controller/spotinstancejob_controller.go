@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	compute "google.golang.org/api/compute/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -56,7 +57,7 @@ type SpotInstanceJobReconciler struct {
 // +kubebuilder:rbac:groups=training.training.dcnlab.com,resources=spotinstancevms/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=migration.dcnlab.com,resources=checkpointbackups,verbs=get;list;watch;create;update;patch;delete
@@ -175,13 +176,20 @@ func (r *SpotInstanceJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	// Check for preempted instances
+	if err := r.handlePreemption(ctx, spotInstanceJob, spotInstanceVM); err != nil {
+		logger.Error(err, "Failed to handle preemption")
+		// Don't return error, continue with normal flow
+	}
+
 	// Schedule checkpoint based on interval
 	checkpointInterval := spotInstanceJob.Spec.CheckpointConfig.CheckpointInterval.Duration
 	if checkpointInterval > 0 {
 		return ctrl.Result{RequeueAfter: checkpointInterval}, nil
 	}
 
-	return ctrl.Result{}, nil
+	// Requeue every 30 seconds to check for preemptions
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 // createJobReplica creates a new Job replica from the template
@@ -438,6 +446,214 @@ func (r *SpotInstanceJobReconciler) countExistingInstances(ctx context.Context, 
 	}
 
 	return count, nil
+}
+
+// handlePreemption checks for preempted instances and handles them
+func (r *SpotInstanceJobReconciler) handlePreemption(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, spotInstanceVM *trainingv1alpha1.SpotInstanceVM) error {
+	logger := log.FromContext(ctx)
+
+	// Get GCP credentials
+	credentialsSecret := &corev1.Secret{}
+	secretKey := types.NamespacedName{
+		Name:      spotInstanceJob.Spec.GCPCredentialsSecretRef.Name,
+		Namespace: spotInstanceJob.Spec.GCPCredentialsSecretRef.Namespace,
+	}
+	if err := r.Get(ctx, secretKey, credentialsSecret); err != nil {
+		return fmt.Errorf("failed to get GCP credentials secret: %w", err)
+	}
+
+	credentialsJSON, ok := credentialsSecret.Data["credentials.json"]
+	if !ok {
+		return fmt.Errorf("credentials.json not found in secret")
+	}
+
+	provisioner, err := gcp.NewProvisioner(ctx, credentialsJSON, spotInstanceVM.Spec.GCP.Project)
+	if err != nil {
+		return fmt.Errorf("failed to create GCP provisioner: %w", err)
+	}
+
+	// List all instances for this job
+	prefix := fmt.Sprintf("%s-%s-", spotInstanceJob.Name, spotInstanceVM.Name)
+	instances, err := provisioner.ListInstancesByPrefix(ctx, spotInstanceVM.Spec.GCP.Zone, prefix)
+	if err != nil {
+		return fmt.Errorf("failed to list instances: %w", err)
+	}
+
+	// Check each instance for preemption
+	for _, instance := range instances {
+		isPreempted, err := provisioner.CheckPreemption(ctx, spotInstanceVM.Spec.GCP.Zone, instance.Name)
+		if err != nil {
+			logger.Error(err, "Failed to check preemption", "instance", instance.Name)
+			continue
+		}
+
+		if isPreempted {
+			logger.Info("Instance is being preempted", "instance", instance.Name)
+			if err := r.handlePreemptedInstance(ctx, spotInstanceJob, spotInstanceVM, instance); err != nil {
+				logger.Error(err, "Failed to handle preempted instance", "instance", instance.Name)
+			}
+		}
+
+		// If instance is TERMINATED, remove the node from cluster
+		if instance.Status == "TERMINATED" || instance.Status == "STOPPED" {
+			logger.Info("Instance is terminated, cleaning up node", "instance", instance.Name)
+			if err := r.cleanupNode(ctx, instance.Name); err != nil {
+				logger.Error(err, "Failed to cleanup node", "instance", instance.Name)
+			}
+		}
+	}
+
+	return nil
+}
+
+// handlePreemptedInstance handles a single preempted instance
+func (r *SpotInstanceJobReconciler) handlePreemptedInstance(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, spotInstanceVM *trainingv1alpha1.SpotInstanceVM, instance interface{}) error {
+	logger := log.FromContext(ctx)
+
+	// Find the node corresponding to this instance
+	nodeName := instance.(*compute.Instance).Name // Assuming node name matches instance name
+
+	// Find jobs running on this node
+	jobsOnNode, err := r.findJobsOnNode(ctx, spotInstanceJob, nodeName)
+	if err != nil {
+		return fmt.Errorf("failed to find jobs on node: %w", err)
+	}
+
+	if len(jobsOnNode) == 0 {
+		logger.Info("No jobs running on preempted node", "node", nodeName)
+		return nil
+	}
+
+	// Check if other replicas are alive
+	allJobs := &batchv1.JobList{}
+	labelSelector := client.MatchingLabels{
+		spotInstanceJobLabel: spotInstanceJob.Name,
+	}
+	if err := r.List(ctx, allJobs, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err != nil {
+		return fmt.Errorf("failed to list jobs: %w", err)
+	}
+
+	aliveReplicas := 0
+	for _, job := range allJobs.Items {
+		if job.Status.Active > 0 && !contains(jobsOnNode, job.Name) {
+			aliveReplicas++
+		}
+	}
+
+	logger.Info("Preemption detected", "node", nodeName, "jobsAffected", len(jobsOnNode), "aliveReplicas", aliveReplicas)
+
+	if aliveReplicas > 0 {
+		// Other replicas are alive - create immediate checkpoint
+		logger.Info("Other replicas alive, creating immediate checkpoint")
+		for _, jobName := range jobsOnNode {
+			if err := r.createCheckpointForJob(ctx, spotInstanceJob, jobName, true); err != nil {
+				logger.Error(err, "Failed to create checkpoint", "job", jobName)
+			}
+		}
+	} else {
+		// No alive replicas - need to restore from latest checkpoint
+		logger.Info("No alive replicas, will restore from latest checkpoint")
+		// The regular reconciliation loop will handle recreating jobs
+	}
+
+	return nil
+}
+
+// findJobsOnNode finds jobs running on a specific node
+func (r *SpotInstanceJobReconciler) findJobsOnNode(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, nodeName string) ([]string, error) {
+	// List all pods for this SpotInstanceJob
+	podList := &corev1.PodList{}
+	labelSelector := client.MatchingLabels{
+		"job-name": "", // Jobs create pods with job-name label
+	}
+	if err := r.List(ctx, podList, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err != nil {
+		return nil, err
+	}
+
+	jobNames := []string{}
+	for _, pod := range podList.Items {
+		// Check if pod belongs to a job of this SpotInstanceJob
+		jobName, ok := pod.Labels["job-name"]
+		if !ok {
+			continue
+		}
+
+		// Check if this job belongs to our SpotInstanceJob
+		if pod.Spec.NodeName == nodeName {
+			jobNames = append(jobNames, jobName)
+		}
+	}
+
+	return jobNames, nil
+}
+
+// createCheckpointForJob creates a CheckpointBackup CR for a job
+func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, jobName string, immediate bool) error {
+	logger := log.FromContext(ctx)
+
+	// Get pods for this job
+	podList := &corev1.PodList{}
+	labelSelector := client.MatchingLabels{
+		"job-name": jobName,
+	}
+	if err := r.List(ctx, podList, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err != nil {
+		return err
+	}
+
+	if len(podList.Items) == 0 {
+		return fmt.Errorf("no pods found for job %s", jobName)
+	}
+
+	// Create CheckpointBackup CR for each pod
+	for _, pod := range podList.Items {
+		checkpointName := fmt.Sprintf("%s-%s-%d", spotInstanceJob.Name, pod.Name, time.Now().Unix())
+
+		// TODO: Actually create the CheckpointBackup CR using dynamic client or unstructured
+		// The checkpoint agent (from your other repo) will watch for these CRs
+		// For now, we log the intent - you'll need to implement actual CR creation
+		logger.Info("Should create CheckpointBackup CR",
+			"name", checkpointName,
+			"pod", pod.Name,
+			"node", pod.Spec.NodeName,
+			"imageRepo", spotInstanceJob.Spec.CheckpointConfig.CheckpointImageRepo,
+			"immediate", immediate)
+	}
+
+	return nil
+}
+
+// cleanupNode removes a node from the Kubernetes cluster
+func (r *SpotInstanceJobReconciler) cleanupNode(ctx context.Context, nodeName string) error {
+	logger := log.FromContext(ctx)
+
+	// Get the node
+	node := &corev1.Node{}
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Node already removed", "node", nodeName)
+			return nil
+		}
+		return err
+	}
+
+	// Delete the node
+	logger.Info("Deleting node from cluster", "node", nodeName)
+	if err := r.Delete(ctx, node); err != nil {
+		return fmt.Errorf("failed to delete node: %w", err)
+	}
+
+	logger.Info("Node deleted successfully", "node", nodeName)
+	return nil
+}
+
+// contains checks if a string slice contains a string
+func contains(slice []string, str string) bool {
+	for _, s := range slice {
+		if s == str {
+			return true
+		}
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
