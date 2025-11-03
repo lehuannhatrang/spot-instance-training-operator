@@ -1,0 +1,65 @@
+apiVersion: training.training.dcnlab.com/v1alpha1
+kind: SpotInstanceJob
+metadata:
+  labels:
+    app.kubernetes.io/name: spot-instance-training-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: spotinstancejob-sample
+spec:
+  # Number of job replicas (default: 2)
+  replicas: 2
+  
+  # Reference to SpotInstanceVM resource
+  spotInstanceVMRef:
+    name: spotinstancevm-sample
+  
+  # GCP credentials secret reference
+  gcpCredentialsSecretRef:
+    name: gcp-credentials
+    namespace: default
+  
+  # Checkpoint configuration
+  checkpointConfig:
+    checkpointImageRepo: "gcr.io/my-gcp-project/training-checkpoints"
+    checkpointInterval: "30m"  # Checkpoint every 30 minutes
+    checkpointStorage:
+      type: "gcs"
+      bucket: "my-training-checkpoints"
+      pathPrefix: "checkpoints/experiment-1"
+  
+  # Job template
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: training
+            image: "my-registry/training-job:latest"
+            command:
+            - "python"
+            - "train.py"
+            args:
+            - "--epochs=100"
+            - "--batch-size=32"
+            - "--checkpoint-dir=/checkpoints"
+            resources:
+              requests:
+                nvidia.com/gpu: 1
+                memory: "8Gi"
+                cpu: "4"
+              limits:
+                nvidia.com/gpu: 1
+                memory: "8Gi"
+                cpu: "4"
+            volumeMounts:
+            - name: checkpoint-storage
+              mountPath: /checkpoints
+            env:
+            - name: TRAINING_JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumes:
+          - name: checkpoint-storage
+            emptyDir: {}

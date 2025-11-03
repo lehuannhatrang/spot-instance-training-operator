@@ -1,0 +1,228 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: spotinstancevms.training.training.dcnlab.com
+spec:
+  group: training.training.dcnlab.com
+  names:
+    kind: SpotInstanceVM
+    listKind: SpotInstanceVMList
+    plural: spotinstancevms
+    singular: spotinstancevm
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: SpotInstanceVM is the Schema for the spotinstancevms API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of SpotInstanceVM
+            properties:
+              gcp:
+                description: GCP defines GCP-specific configuration
+                properties:
+                  diskSizeGB:
+                    default: 100
+                    description: DiskSizeGB is the boot disk size in GB
+                    format: int32
+                    type: integer
+                  diskType:
+                    default: pd-standard
+                    description: DiskType is the disk type (e.g., "pd-standard", "pd-ssd")
+                    type: string
+                  machineType:
+                    description: MachineType is the GCP machine type (e.g., "n1-standard-4")
+                    type: string
+                  networkTags:
+                    description: NetworkTags are network tags to apply to the instance
+                    items:
+                      type: string
+                    type: array
+                  project:
+                    description: Project is the GCP project ID
+                    type: string
+                  region:
+                    description: Region is the GCP region (optional, derived from
+                      zone if not provided)
+                    type: string
+                  serviceAccount:
+                    description: ServiceAccount is the service account email for the
+                      instance
+                    type: string
+                  zone:
+                    description: Zone is the GCP zone for the instance
+                    type: string
+                required:
+                - machineType
+                - project
+                - zone
+                type: object
+              gpu:
+                description: GPU defines GPU configuration for the VM
+                properties:
+                  count:
+                    description: Count is the number of GPUs to attach
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  type:
+                    description: Type is the GPU type (e.g., "nvidia-tesla-t4", "nvidia-tesla-v100")
+                    type: string
+                required:
+                - count
+                - type
+                type: object
+              kubeadmJoinConfig:
+                description: KubeadmJoinConfig defines configuration for joining the
+                  Kubernetes cluster
+                properties:
+                  caCertHash:
+                    description: CACertHash is the CA certificate hash for kubeadm
+                      join
+                    type: string
+                  controlPlaneEndpoint:
+                    description: ControlPlaneEndpoint is the control plane endpoint
+                    type: string
+                  tokenSecretRef:
+                    description: TokenSecretRef is a reference to the secret containing
+                      the kubeadm token
+                    type: string
+                type: object
+              startupScript:
+                description: StartupScript is the startup script to run when the VM
+                  starts
+                type: string
+              vmImage:
+                description: VMImage is the source image for the VM (e.g., "projects/debian-cloud/global/images/debian-11-bullseye-v20230629")
+                type: string
+            required:
+            - gcp
+            - vmImage
+            type: object
+          status:
+            description: status defines the observed state of SpotInstanceVM
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of an object's state
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              provisionedInstances:
+                description: ProvisionedInstances tracks the provisioned VM instances
+                items:
+                  description: VMInstanceStatus tracks the status of a provisioned
+                    VM instance
+                  properties:
+                    creationTime:
+                      description: CreationTime is when the instance was created
+                      format: date-time
+                      type: string
+                    externalIP:
+                      description: ExternalIP is the external IP address of the instance
+                      type: string
+                    instanceID:
+                      description: InstanceID is the GCP instance ID
+                      type: string
+                    internalIP:
+                      description: InternalIP is the internal IP address of the instance
+                      type: string
+                    joinedCluster:
+                      description: JoinedCluster indicates whether the instance has
+                        joined the Kubernetes cluster
+                      type: boolean
+                    name:
+                      description: Name is the name of the VM instance
+                      type: string
+                    nodeName:
+                      description: NodeName is the Kubernetes node name after joining
+                        the cluster
+                      type: string
+                    state:
+                      description: State is the current state of the instance
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

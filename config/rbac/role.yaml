@@ -1,0 +1,75 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - pods
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs/status
+  verbs:
+  - get
+- apiGroups:
+  - migration.dcnlab.com
+  resources:
+  - checkpointbackups
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - training.training.dcnlab.com
+  resources:
+  - spotinstancejobs
+  - spotinstancevms
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - training.training.dcnlab.com
+  resources:
+  - spotinstancejobs/finalizers
+  - spotinstancevms/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - training.training.dcnlab.com
+  resources:
+  - spotinstancejobs/status
+  - spotinstancevms/status
+  verbs:
+  - get
+  - patch
+  - update

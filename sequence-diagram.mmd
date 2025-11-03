@@ -1,0 +1,39 @@
+sequenceDiagram
+    autonumber
+    %% participant User as User / Job
+    participant Orch as Orchestrator (Controller)
+    participant SIA as SpotInstance-A (GPU)
+    participant SIB as SpotInstance-B (GPU)
+    participant CS as CheckpointStorage
+    participant NewSI as NewSpotInstance(s)
+
+    Note over Orch , SIB: Initial deployment
+    %% User->>Orch: submit GPU job
+    Orch->>SIA: request spot instance A + deploy GPU pod
+    Orch->>SIB: request spot instance B + deploy GPU pod
+    SIA->>Orch: ready
+    SIB->>Orch: ready
+
+    Note over SIA, CS: Regular scheduled checkpoint
+    loop every checkpoint_interval
+      SIA->>CS: upload checkpoint (A, timestampA)
+      SIB->>CS: upload checkpoint (B, timestampB)
+    end
+
+    Note over Orch , NewSI: Preemption event scenario 1: SIA preempted
+    SIA-->>Orch: preemption notice (or loss detected)
+    Orch->>SIB: request immediate checkpoint (live) and upload to CS
+    SIB->>CS: upload checkpoint (live_from_B, timestampLive)
+    Orch->>NewSI: request replacement spot instance
+    NewSI->>CS: download latest checkpoint (timestampLive)
+    NewSI->>Orch: restored / started from checkpoint
+    %% Orch->>User: job continues on SIB + NewSI
+
+    Note over Orch , NewSI: Preemption event scenario 2: both preempted
+    SIA-->>Orch: preempted
+    SIB-->>Orch: preempted
+    Orch->>CS: query latest scheduled checkpoint (max timestamp)
+    Orch->>NewSI: request 2 replacement spot instances
+    NewSI->>CS: download latest checkpoint
+    NewSI->>Orch: restored / started from checkpoint
+    %% Orch->>User: job resumed on NewSI(s)

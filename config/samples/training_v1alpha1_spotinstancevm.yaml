@@ -1,0 +1,49 @@
+apiVersion: training.training.dcnlab.com/v1alpha1
+kind: SpotInstanceVM
+metadata:
+  labels:
+    app.kubernetes.io/name: spot-instance-training-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: spotinstancevm-sample
+spec:
+  vmImage: "projects/cos-cloud/global/images/cos-stable-109-17800-147-54"
+  
+  gpu:
+    type: "nvidia-tesla-t4"
+    count: 1
+  
+  gcp:
+    project: "my-gcp-project"
+    zone: "us-central1-a"
+    region: "us-central1"
+    machineType: "n1-standard-4"
+    diskSizeGB: 100
+    diskType: "pd-standard"
+    networkTags:
+      - "k8s-worker"
+      - "spot-instance"
+    serviceAccount: "spot-instance-sa@my-gcp-project.iam.gserviceaccount.com"
+  
+  startupScript: |
+    #!/bin/bash
+    # Install Docker
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    
+    # Install kubeadm, kubelet, kubectl
+    apt-get update && apt-get install -y apt-transport-https ca-certificates curl
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
+    apt-get update
+    apt-get install -y kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+    
+    # Install NVIDIA GPU Operator dependencies
+    distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+    curl -s -L https://nvidia.github.io/libnvidia-container/gpgkey | apt-key add -
+    curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | tee /etc/apt/sources.list.d/libnvidia-container.list
+  
+  kubeadmJoinConfig:
+    tokenSecretRef: "kubeadm-join-token"
+    caCertHash: "sha256:abc123..."
+    controlPlaneEndpoint: "control-plane.example.com:6443"
