@@ -149,10 +149,12 @@ func (r *SpotInstanceJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Info("Not enough resources, provisioning spot instances", "needed", needed)
 			if err := r.provisionSpotInstances(ctx, spotInstanceJob, spotInstanceVM, needed); err != nil {
 				logger.Error(err, "Failed to provision spot instances")
-				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+				// If instances are being provisioned, wait longer for them to join
+				return ctrl.Result{RequeueAfter: 60 * time.Second}, err
 			}
-			// Requeue to wait for nodes to be ready
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			// Requeue to wait for nodes to be ready (2 minutes should be enough for boot + join)
+			logger.Info("Waiting for provisioned instances to join cluster")
+			return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
 		}
 
 		// Create missing jobs
@@ -307,6 +309,22 @@ func (r *SpotInstanceJobReconciler) provisionSpotInstances(ctx context.Context, 
 		return fmt.Errorf("failed to create GCP provisioner: %w", err)
 	}
 
+	// Check how many instances are already provisioned or being provisioned
+	existingCount, err := r.countExistingInstances(ctx, provisioner, spotInstanceJob, spotInstanceVM)
+	if err != nil {
+		logger.Error(err, "Failed to count existing instances, will proceed with provisioning")
+	} else if existingCount >= count {
+		logger.Info("Sufficient instances already exist or are being provisioned",
+			"existing", existingCount, "needed", count)
+		// Requeue to check if nodes are ready
+		return fmt.Errorf("instances being provisioned, waiting for nodes to join")
+	} else if existingCount > 0 {
+		// Reduce count by already existing instances
+		count = count - existingCount
+		logger.Info("Reducing provision count due to existing instances",
+			"existing", existingCount, "willProvision", count)
+	}
+
 	// Get kubeadm token from secret
 	// Try to get from kubeadmJoinConfig first, otherwise look for standard secret name
 	secretName := "kubeadm-join-token"
@@ -393,6 +411,33 @@ func (r *SpotInstanceJobReconciler) updateVMStatus(ctx context.Context, spotInst
 	latest.Status.ProvisionedInstances = append(latest.Status.ProvisionedInstances, vmStatus)
 
 	return r.Status().Update(ctx, latest)
+}
+
+// countExistingInstances counts instances already provisioned for this job
+func (r *SpotInstanceJobReconciler) countExistingInstances(ctx context.Context, provisioner *gcp.Provisioner, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, spotInstanceVM *trainingv1alpha1.SpotInstanceVM) (int32, error) {
+	logger := log.FromContext(ctx)
+
+	// List instances from GCP that match our naming pattern
+	// Instances are named: {job-name}-{vm-name}-{index}-{timestamp}
+	prefix := fmt.Sprintf("%s-%s-", spotInstanceJob.Name, spotInstanceVM.Name)
+
+	instances, err := provisioner.ListInstancesByPrefix(ctx, spotInstanceVM.Spec.GCP.Zone, prefix)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list GCP instances: %w", err)
+	}
+
+	// Count instances that are RUNNING or PROVISIONING
+	count := int32(0)
+	for _, instance := range instances {
+		status := instance.Status
+		// Count instances that are not TERMINATED or STOPPED
+		if status == "PROVISIONING" || status == "STAGING" || status == "RUNNING" {
+			count++
+			logger.Info("Found existing instance", "name", instance.Name, "status", status)
+		}
+	}
+
+	return count, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

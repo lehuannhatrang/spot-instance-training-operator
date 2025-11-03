@@ -190,6 +190,25 @@ func (p *Provisioner) GetInstance(ctx context.Context, zone, instanceName string
 	return instance, nil
 }
 
+// ListInstancesByPrefix lists instances in a zone with a name prefix
+func (p *Provisioner) ListInstancesByPrefix(ctx context.Context, zone, prefix string) ([]*compute.Instance, error) {
+	// List all instances in the zone
+	instanceList, err := p.computeService.Instances.List(p.project, zone).Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list instances: %w", err)
+	}
+
+	// Filter instances by prefix
+	var matchingInstances []*compute.Instance
+	for _, instance := range instanceList.Items {
+		if len(instance.Name) >= len(prefix) && instance.Name[:len(prefix)] == prefix {
+			matchingInstances = append(matchingInstances, instance)
+		}
+	}
+
+	return matchingInstances, nil
+}
+
 // waitForOperation waits for a GCP operation to complete
 func (p *Provisioner) waitForOperation(ctx context.Context, op *compute.Operation, zone string) error {
 	for {
