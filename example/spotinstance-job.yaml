@@ -7,15 +7,15 @@ spec:
   instanceTemplateRef:
     name: testla-t4-1-gpu
   gcpCredentialsSecretRef:
-    name: backup-registry-lehuannhatrang-docker-1762182873
-    namespace: stateful-migration
+    name: gcp-credentials
+    namespace: default
   checkpointConfig:
     checkpointImageRepo: "docker.io/lehuannhatrang/gpu-checkpoints"
     checkpointInterval: "30m"
     # Optional: credentials for pushing checkpoint images
-    # checkpointRepoCredentialRef:
-    #   name: "checkpoint-repo-credentials"
-    #   namespace: "default"
+    checkpointRepoCredentialRef:
+      name: "backup-registry-lehuannhatrang-docker-1762182873"
+      namespace: "stateful-migration"
   jobTemplate:
     spec:
       template:
