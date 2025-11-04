@@ -4,6 +4,8 @@
 resources:
 - bases/training.training.dcnlab.com_spotinstancejobs.yaml
 - bases/training.training.dcnlab.com_spotinstancevms.yaml
+- bases/training.training.dcnlab.com_instancetemplates.yaml
+- bases/training.training.dcnlab.com_provisionedinstances.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

@@ -9,9 +9,9 @@ spec:
   # Number of job replicas (default: 2)
   replicas: 2
   
-  # Reference to SpotInstanceVM resource
-  spotInstanceVMRef:
-    name: spotinstancevm-sample
+  # Reference to InstanceTemplate resource
+  instanceTemplateRef:
+    name: gpu-instance-template
   
   # GCP credentials secret reference
   gcpCredentialsSecretRef:

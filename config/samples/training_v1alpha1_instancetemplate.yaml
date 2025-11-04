@@ -1,0 +1,17 @@
+apiVersion: training.training.dcnlab.com/v1alpha1
+kind: InstanceTemplate
+metadata:
+  name: gpu-instance-template
+  namespace: default
+spec:
+  vmImage: "projects/criu-with-gpu-dcn/global/images/image-ubuntu-2404-gpu-580-v2"
+  gpu:
+    type: "nvidia-tesla-t4"
+    count: 1
+  gcp:
+    project: "your-gcp-project"
+    zone: "us-central1-a"
+    machineType: "n1-standard-4"
+    diskSizeGB: 100
+    diskType: "pd-standard"
+  preemptible: true  # Set to false for on-demand instances

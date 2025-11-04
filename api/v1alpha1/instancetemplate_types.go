@@ -72,8 +72,8 @@ type GPUConfig struct {
 	Count int32 `json:"count"`
 }
 
-// SpotInstanceVMSpec defines the desired state of SpotInstanceVM
-type SpotInstanceVMSpec struct {
+// InstanceTemplateSpec defines the desired state of InstanceTemplate
+type InstanceTemplateSpec struct {
 	// VMImage is the source image for the VM (e.g., "projects/debian-cloud/global/images/debian-11-bullseye-v20230629")
 	// +required
 	VMImage string `json:"vmImage"`
@@ -90,100 +90,48 @@ type SpotInstanceVMSpec struct {
 	// +optional
 	StartupScript string `json:"startupScript,omitempty"`
 
-	// KubeadmJoinConfig defines configuration for joining the Kubernetes cluster
+	// Preemptible determines whether to create spot instances (true) or on-demand instances (false)
+	// +kubebuilder:default=true
 	// +optional
-	KubeadmJoinConfig *KubeadmJoinConfig `json:"kubeadmJoinConfig,omitempty"`
+	Preemptible *bool `json:"preemptible,omitempty"`
 }
 
-// KubeadmJoinConfig defines configuration for joining the Kubernetes cluster
-type KubeadmJoinConfig struct {
-	// TokenSecretRef is a reference to the secret containing the kubeadm token
-	// +optional
-	TokenSecretRef string `json:"tokenSecretRef,omitempty"`
-
-	// CACertHash is the CA certificate hash for kubeadm join
-	// +optional
-	CACertHash string `json:"caCertHash,omitempty"`
-
-	// ControlPlaneEndpoint is the control plane endpoint
-	// +optional
-	ControlPlaneEndpoint string `json:"controlPlaneEndpoint,omitempty"`
-}
-
-// SpotInstanceVMStatus defines the observed state of SpotInstanceVM.
-type SpotInstanceVMStatus struct {
+// InstanceTemplateStatus defines the observed state of InstanceTemplate.
+type InstanceTemplateStatus struct {
 	// Conditions represent the latest available observations of an object's state
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-
-	// ProvisionedInstances tracks the provisioned VM instances
-	// +optional
-	ProvisionedInstances []VMInstanceStatus `json:"provisionedInstances,omitempty"`
-}
-
-// VMInstanceStatus tracks the status of a provisioned VM instance
-type VMInstanceStatus struct {
-	// Name is the name of the VM instance
-	Name string `json:"name"`
-
-	// InstanceID is the GCP instance ID
-	// +optional
-	InstanceID string `json:"instanceID,omitempty"`
-
-	// InternalIP is the internal IP address of the instance
-	// +optional
-	InternalIP string `json:"internalIP,omitempty"`
-
-	// ExternalIP is the external IP address of the instance
-	// +optional
-	ExternalIP string `json:"externalIP,omitempty"`
-
-	// State is the current state of the instance
-	// +optional
-	State string `json:"state,omitempty"`
-
-	// JoinedCluster indicates whether the instance has joined the Kubernetes cluster
-	// +optional
-	JoinedCluster bool `json:"joinedCluster,omitempty"`
-
-	// NodeName is the Kubernetes node name after joining the cluster
-	// +optional
-	NodeName string `json:"nodeName,omitempty"`
-
-	// CreationTime is when the instance was created
-	// +optional
-	CreationTime *metav1.Time `json:"creationTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 
-// SpotInstanceVM is the Schema for the spotinstancevms API
-type SpotInstanceVM struct {
+// InstanceTemplate is the Schema for the instancetemplates API
+type InstanceTemplate struct {
 	metav1.TypeMeta `json:",inline"`
 
 	// metadata is a standard object metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty,omitzero"`
 
-	// spec defines the desired state of SpotInstanceVM
+	// spec defines the desired state of InstanceTemplate
 	// +required
-	Spec SpotInstanceVMSpec `json:"spec"`
+	Spec InstanceTemplateSpec `json:"spec"`
 
-	// status defines the observed state of SpotInstanceVM
+	// status defines the observed state of InstanceTemplate
 	// +optional
-	Status SpotInstanceVMStatus `json:"status,omitempty,omitzero"`
+	Status InstanceTemplateStatus `json:"status,omitempty,omitzero"`
 }
 
 // +kubebuilder:object:root=true
 
-// SpotInstanceVMList contains a list of SpotInstanceVM
-type SpotInstanceVMList struct {
+// InstanceTemplateList contains a list of InstanceTemplate
+type InstanceTemplateList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []SpotInstanceVM `json:"items"`
+	Items           []InstanceTemplate `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&SpotInstanceVM{}, &SpotInstanceVMList{})
+	SchemeBuilder.Register(&InstanceTemplate{}, &InstanceTemplateList{})
 }

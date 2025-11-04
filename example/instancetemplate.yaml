@@ -1,5 +1,5 @@
 apiVersion: training.training.dcnlab.com/v1alpha1
-kind: SpotInstanceVM
+kind: InstanceTemplate
 metadata:
   name: testla-t4-1-gpu
 spec:
@@ -13,8 +13,13 @@ spec:
     machineType: "n1-standard-4"
     diskSizeGB: 100
   
+  # Preemptible determines whether to use spot instances (true) or on-demand (false)
+  # Default: true
+  preemptible: true
+  
   # Note: Nodes will auto-join cluster if 'kubeadm-join-token' secret exists in the namespace
   # Create it with: kubectl create secret generic kubeadm-join-token \
   #   --from-literal=token=<token> \
   #   --from-literal=ca-cert-hash=<hash> \
   #   --from-literal=control-plane-endpoint=<endpoint>
+

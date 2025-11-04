@@ -4,20 +4,20 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.18.0
-  name: spotinstancevms.training.training.dcnlab.com
+  name: instancetemplates.training.training.dcnlab.com
 spec:
   group: training.training.dcnlab.com
   names:
-    kind: SpotInstanceVM
-    listKind: SpotInstanceVMList
-    plural: spotinstancevms
-    singular: spotinstancevm
+    kind: InstanceTemplate
+    listKind: InstanceTemplateList
+    plural: instancetemplates
+    singular: instancetemplate
   scope: Namespaced
   versions:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: SpotInstanceVM is the Schema for the spotinstancevms API
+        description: InstanceTemplate is the Schema for the instancetemplates API
         properties:
           apiVersion:
             description: |-
@@ -37,7 +37,7 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of SpotInstanceVM
+            description: spec defines the desired state of InstanceTemplate
             properties:
               gcp:
                 description: GCP defines GCP-specific configuration
@@ -93,22 +93,11 @@ spec:
                 - count
                 - type
                 type: object
-              kubeadmJoinConfig:
-                description: KubeadmJoinConfig defines configuration for joining the
-                  Kubernetes cluster
-                properties:
-                  caCertHash:
-                    description: CACertHash is the CA certificate hash for kubeadm
-                      join
-                    type: string
-                  controlPlaneEndpoint:
-                    description: ControlPlaneEndpoint is the control plane endpoint
-                    type: string
-                  tokenSecretRef:
-                    description: TokenSecretRef is a reference to the secret containing
-                      the kubeadm token
-                    type: string
-                type: object
+              preemptible:
+                default: true
+                description: Preemptible determines whether to create spot instances
+                  (true) or on-demand instances (false)
+                type: boolean
               startupScript:
                 description: StartupScript is the startup script to run when the VM
                   starts
@@ -121,7 +110,7 @@ spec:
             - vmImage
             type: object
           status:
-            description: status defines the observed state of SpotInstanceVM
+            description: status defines the observed state of InstanceTemplate
             properties:
               conditions:
                 description: Conditions represent the latest available observations
@@ -179,43 +168,6 @@ spec:
                   - reason
                   - status
                   - type
-                  type: object
-                type: array
-              provisionedInstances:
-                description: ProvisionedInstances tracks the provisioned VM instances
-                items:
-                  description: VMInstanceStatus tracks the status of a provisioned
-                    VM instance
-                  properties:
-                    creationTime:
-                      description: CreationTime is when the instance was created
-                      format: date-time
-                      type: string
-                    externalIP:
-                      description: ExternalIP is the external IP address of the instance
-                      type: string
-                    instanceID:
-                      description: InstanceID is the GCP instance ID
-                      type: string
-                    internalIP:
-                      description: InternalIP is the internal IP address of the instance
-                      type: string
-                    joinedCluster:
-                      description: JoinedCluster indicates whether the instance has
-                        joined the Kubernetes cluster
-                      type: boolean
-                    name:
-                      description: Name is the name of the VM instance
-                      type: string
-                    nodeName:
-                      description: NodeName is the Kubernetes node name after joining
-                        the cluster
-                      type: string
-                    state:
-                      description: State is the current state of the instance
-                      type: string
-                  required:
-                  - name
                   type: object
                 type: array
             type: object

@@ -21,8 +21,11 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,15 +46,65 @@ var _ = Describe("SpotInstanceJob Controller", func() {
 		spotinstancejob := &trainingv1alpha1.SpotInstanceJob{}
 
 		BeforeEach(func() {
+			By("creating an InstanceTemplate")
+			template := &trainingv1alpha1.InstanceTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+				Spec: trainingv1alpha1.InstanceTemplateSpec{
+					VMImage:     "test-image",
+					Preemptible: ptr.To(true),
+					GCP: trainingv1alpha1.GCPConfig{
+						Project:     "test-project",
+						Zone:        "test-zone",
+						MachineType: "n1-standard-1",
+						DiskSizeGB:  100,
+					},
+				},
+			}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-template", Namespace: "default"}, template)
+			if err != nil && errors.IsNotFound(err) {
+				Expect(k8sClient.Create(ctx, template)).To(Succeed())
+			}
+
 			By("creating the custom resource for the Kind SpotInstanceJob")
-			err := k8sClient.Get(ctx, typeNamespacedName, spotinstancejob)
+			err = k8sClient.Get(ctx, typeNamespacedName, spotinstancejob)
 			if err != nil && errors.IsNotFound(err) {
 				resource := &trainingv1alpha1.SpotInstanceJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: trainingv1alpha1.SpotInstanceJobSpec{
+						Replicas: ptr.To(int32(1)),
+						InstanceTemplateRef: corev1.LocalObjectReference{
+							Name: "test-template",
+						},
+						GCPCredentialsSecretRef: corev1.SecretReference{
+							Name:      "test-creds",
+							Namespace: "default",
+						},
+						CheckpointConfig: trainingv1alpha1.CheckpointConfig{
+							CheckpointImageRepo: "test-repo",
+							CheckpointInterval:  metav1.Duration{Duration: 0},
+						},
+						JobTemplate: batchv1.JobTemplateSpec{
+							Spec: batchv1.JobSpec{
+								Template: corev1.PodTemplateSpec{
+									Spec: corev1.PodSpec{
+										Containers: []corev1.Container{
+											{
+												Name:  "test",
+												Image: "test",
+											},
+										},
+										RestartPolicy: corev1.RestartPolicyNever,
+									},
+								},
+							},
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

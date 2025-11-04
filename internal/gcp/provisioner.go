@@ -53,15 +53,14 @@ func NewProvisioner(ctx context.Context, credentialsJSON []byte, project string)
 }
 
 // ProvisionSpotInstance creates a new GCP spot instance
-func (p *Provisioner) ProvisionSpotInstance(ctx context.Context, vmSpec *trainingv1alpha1.SpotInstanceVMSpec, instanceName string) (*compute.Instance, error) {
-	zone := vmSpec.GCP.Zone
+func (p *Provisioner) ProvisionSpotInstance(ctx context.Context, templateSpec *trainingv1alpha1.InstanceTemplateSpec, instanceName string, preemptible bool) (*compute.Instance, error) {
+	zone := templateSpec.GCP.Zone
 
 	// Prepare the instance configuration
-	preemptible := true
 	automaticRestart := false
 	instance := &compute.Instance{
 		Name:        instanceName,
-		MachineType: fmt.Sprintf("zones/%s/machineTypes/%s", zone, vmSpec.GCP.MachineType),
+		MachineType: fmt.Sprintf("zones/%s/machineTypes/%s", zone, templateSpec.GCP.MachineType),
 		Scheduling: &compute.Scheduling{
 			Preemptible:       preemptible,
 			AutomaticRestart:  &automaticRestart,
@@ -72,9 +71,9 @@ func (p *Provisioner) ProvisionSpotInstance(ctx context.Context, vmSpec *trainin
 				Boot:       true,
 				AutoDelete: true,
 				InitializeParams: &compute.AttachedDiskInitializeParams{
-					SourceImage: vmSpec.VMImage,
-					DiskSizeGb:  int64(vmSpec.GCP.DiskSizeGB),
-					DiskType:    fmt.Sprintf("zones/%s/diskTypes/%s", zone, vmSpec.GCP.DiskType),
+					SourceImage: templateSpec.VMImage,
+					DiskSizeGb:  int64(templateSpec.GCP.DiskSizeGB),
+					DiskType:    fmt.Sprintf("zones/%s/diskTypes/%s", zone, templateSpec.GCP.DiskType),
 				},
 			},
 		},
@@ -91,11 +90,11 @@ func (p *Provisioner) ProvisionSpotInstance(ctx context.Context, vmSpec *trainin
 	}
 
 	// Add GPU if specified
-	if vmSpec.GPU != nil {
+	if templateSpec.GPU != nil {
 		instance.GuestAccelerators = []*compute.AcceleratorConfig{
 			{
-				AcceleratorCount: int64(vmSpec.GPU.Count),
-				AcceleratorType:  fmt.Sprintf("zones/%s/acceleratorTypes/%s", zone, vmSpec.GPU.Type),
+				AcceleratorCount: int64(templateSpec.GPU.Count),
+				AcceleratorType:  fmt.Sprintf("zones/%s/acceleratorTypes/%s", zone, templateSpec.GPU.Type),
 			},
 		}
 		// GPU instances need to allow GPU passthrough
@@ -103,23 +102,7 @@ func (p *Provisioner) ProvisionSpotInstance(ctx context.Context, vmSpec *trainin
 	}
 
 	// Add startup script if provided
-	startupScript := vmSpec.StartupScript
-
-	// If kubeadm join config is provided, append join command to startup script
-	if vmSpec.KubeadmJoinConfig != nil &&
-		vmSpec.KubeadmJoinConfig.ControlPlaneEndpoint != "" &&
-		vmSpec.KubeadmJoinConfig.CACertHash != "" {
-		// Note: Token should be retrieved from secret, but for startup script we need it here
-		// This is a simplified version - in production, you'd handle token more securely
-		joinCmd := "\n\n# Join Kubernetes cluster\n"
-		joinCmd += "while ! systemctl is-active --quiet kubelet; do\n"
-		joinCmd += "  echo 'Waiting for kubelet...'\n"
-		joinCmd += "  sleep 5\n"
-		joinCmd += "done\n"
-		joinCmd += "echo 'Joining cluster...'\n"
-		// The actual join will be handled by SSH after provisioning
-		startupScript += joinCmd
-	}
+	startupScript := templateSpec.StartupScript
 
 	if startupScript != "" {
 		instance.Metadata = &compute.Metadata{
@@ -133,17 +116,17 @@ func (p *Provisioner) ProvisionSpotInstance(ctx context.Context, vmSpec *trainin
 	}
 
 	// Add network tags
-	if len(vmSpec.GCP.NetworkTags) > 0 {
+	if len(templateSpec.GCP.NetworkTags) > 0 {
 		instance.Tags = &compute.Tags{
-			Items: vmSpec.GCP.NetworkTags,
+			Items: templateSpec.GCP.NetworkTags,
 		}
 	}
 
 	// Add service account
-	if vmSpec.GCP.ServiceAccount != "" {
+	if templateSpec.GCP.ServiceAccount != "" {
 		instance.ServiceAccounts = []*compute.ServiceAccount{
 			{
-				Email: vmSpec.GCP.ServiceAccount,
+				Email: templateSpec.GCP.ServiceAccount,
 				Scopes: []string{
 					compute.CloudPlatformScope,
 				},
@@ -248,4 +231,19 @@ func (p *Provisioner) CheckPreemption(ctx context.Context, zone, instanceName st
 	}
 
 	return false, nil
+}
+
+// DeleteInstance deletes a GCP instance
+func (p *Provisioner) DeleteInstance(ctx context.Context, project, zone, instanceName string) error {
+	op, err := p.computeService.Instances.Delete(project, zone, instanceName).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("failed to delete instance: %w", err)
+	}
+
+	// Wait for the operation to complete
+	if err := p.waitForOperation(ctx, op, zone); err != nil {
+		return fmt.Errorf("failed to wait for delete operation: %w", err)
+	}
+
+	return nil
 }

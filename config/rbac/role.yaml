@@ -55,8 +55,16 @@ rules:
 - apiGroups:
   - training.training.dcnlab.com
   resources:
+  - instancetemplates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - training.training.dcnlab.com
+  resources:
+  - provisionedinstances
   - spotinstancejobs
-  - spotinstancevms
   verbs:
   - create
   - delete
@@ -68,15 +76,15 @@ rules:
 - apiGroups:
   - training.training.dcnlab.com
   resources:
+  - provisionedinstances/finalizers
   - spotinstancejobs/finalizers
-  - spotinstancevms/finalizers
   verbs:
   - update
 - apiGroups:
   - training.training.dcnlab.com
   resources:
+  - provisionedinstances/status
   - spotinstancejobs/status
-  - spotinstancevms/status
   verbs:
   - get
   - patch

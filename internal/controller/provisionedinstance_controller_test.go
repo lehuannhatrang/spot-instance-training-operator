@@ -21,8 +21,10 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,7 +32,7 @@ import (
 	trainingv1alpha1 "github.com/dcnlab/spot-instance-training-operator/api/v1alpha1"
 )
 
-var _ = Describe("SpotInstanceVM Controller", func() {
+var _ = Describe("ProvisionedInstance Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
 
@@ -40,18 +42,47 @@ var _ = Describe("SpotInstanceVM Controller", func() {
 			Name:      resourceName,
 			Namespace: "default", // TODO(user):Modify as needed
 		}
-		spotinstancevm := &trainingv1alpha1.SpotInstanceVM{}
+		provisionedinstance := &trainingv1alpha1.ProvisionedInstance{}
 
 		BeforeEach(func() {
-			By("creating the custom resource for the Kind SpotInstanceVM")
-			err := k8sClient.Get(ctx, typeNamespacedName, spotinstancevm)
+			By("creating an InstanceTemplate")
+			template := &trainingv1alpha1.InstanceTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-template",
+					Namespace: "default",
+				},
+				Spec: trainingv1alpha1.InstanceTemplateSpec{
+					VMImage:     "test-image",
+					Preemptible: ptr.To(true),
+					GCP: trainingv1alpha1.GCPConfig{
+						Project:     "test-project",
+						Zone:        "test-zone",
+						MachineType: "n1-standard-1",
+						DiskSizeGB:  100,
+					},
+				},
+			}
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-template", Namespace: "default"}, template)
 			if err != nil && errors.IsNotFound(err) {
-				resource := &trainingv1alpha1.SpotInstanceVM{
+				Expect(k8sClient.Create(ctx, template)).To(Succeed())
+			}
+
+			By("creating the custom resource for the Kind ProvisionedInstance")
+			err = k8sClient.Get(ctx, typeNamespacedName, provisionedinstance)
+			if err != nil && errors.IsNotFound(err) {
+				resource := &trainingv1alpha1.ProvisionedInstance{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: trainingv1alpha1.ProvisionedInstanceSpec{
+						InstanceTemplateName:      "test-template",
+						InstanceTemplateNamespace: "default",
+						GCPCredentialsSecretRef: corev1.SecretReference{
+							Name:      "test-creds",
+							Namespace: "default",
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
@@ -59,16 +90,16 @@ var _ = Describe("SpotInstanceVM Controller", func() {
 
 		AfterEach(func() {
 			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &trainingv1alpha1.SpotInstanceVM{}
+			resource := &trainingv1alpha1.ProvisionedInstance{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("Cleanup the specific resource instance SpotInstanceVM")
+			By("Cleanup the specific resource instance ProvisionedInstance")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &SpotInstanceVMReconciler{
+			controllerReconciler := &ProvisionedInstanceReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
 			}

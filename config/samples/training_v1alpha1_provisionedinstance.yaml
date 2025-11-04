@@ -1,0 +1,14 @@
+apiVersion: training.training.dcnlab.com/v1alpha1
+kind: ProvisionedInstance
+metadata:
+  name: example-provisioned-instance
+  namespace: default
+spec:
+  instanceTemplateName: gpu-instance-template
+  instanceTemplateNamespace: default
+  gcpCredentialsSecretRef:
+    name: gcp-credentials
+    namespace: default
+---
+# Note: ProvisionedInstance CRs are typically created automatically by the SpotInstanceJob controller.
+# This is just an example of how the resource looks.

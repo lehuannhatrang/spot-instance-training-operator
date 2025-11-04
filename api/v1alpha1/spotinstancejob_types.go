@@ -77,9 +77,9 @@ type SpotInstanceJobSpec struct {
 	// +required
 	CheckpointConfig CheckpointConfig `json:"checkpointConfig"`
 
-	// SpotInstanceVMRef is a reference to the SpotInstanceVM resource
+	// InstanceTemplateRef is a reference to the InstanceTemplate resource
 	// +required
-	SpotInstanceVMRef corev1.LocalObjectReference `json:"spotInstanceVMRef"`
+	InstanceTemplateRef corev1.LocalObjectReference `json:"instanceTemplateRef"`
 
 	// GCPCredentialsSecretRef is a reference to the secret containing GCP credentials
 	// +required

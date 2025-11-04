@@ -209,11 +209,11 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "SpotInstanceJob")
 		os.Exit(1)
 	}
-	if err := (&controller.SpotInstanceVMReconciler{
+	if err := (&controller.ProvisionedInstanceReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "SpotInstanceVM")
+		setupLog.Error(err, "unable to create controller", "controller", "ProvisionedInstance")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
