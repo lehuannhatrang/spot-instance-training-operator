@@ -28,9 +28,6 @@ resources:
 - instancetemplate_admin_role.yaml
 - instancetemplate_editor_role.yaml
 - instancetemplate_viewer_role.yaml
-- spotinstancevm_admin_role.yaml
-- spotinstancevm_editor_role.yaml
-- spotinstancevm_viewer_role.yaml
 - spotinstancejob_admin_role.yaml
 - spotinstancejob_editor_role.yaml
 - spotinstancejob_viewer_role.yaml

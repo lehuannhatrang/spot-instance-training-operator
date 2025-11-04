@@ -1,7 +1,6 @@
 ## Append samples of your project ##
 resources:
 - training_v1alpha1_spotinstancejob.yaml
-- training_v1alpha1_spotinstancevm.yaml
 - training_v1alpha1_instancetemplate.yaml
 - training_v1alpha1_provisionedinstance.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

@@ -21,15 +21,6 @@ resources:
 - api:
     crdVersion: v1
     namespaced: true
-  controller: true
-  domain: training.dcnlab.com
-  group: training
-  kind: SpotInstanceVM
-  path: github.com/dcnlab/spot-instance-training-operator/api/v1alpha1
-  version: v1alpha1
-- api:
-    crdVersion: v1
-    namespaced: true
   domain: training.dcnlab.com
   group: training
   kind: InstanceTemplate
