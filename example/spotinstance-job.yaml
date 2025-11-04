@@ -7,8 +7,8 @@ spec:
   instanceTemplateRef:
     name: testla-t4-1-gpu
   gcpCredentialsSecretRef:
-    name: gcp-credentials
-    namespace: default
+    name: backup-registry-lehuannhatrang-docker-1762182873
+    namespace: stateful-migration
   checkpointConfig:
     checkpointImageRepo: "docker.io/lehuannhatrang/gpu-checkpoints"
     checkpointInterval: "30m"
@@ -24,7 +24,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: trainer
-            image: deepspeed/deepspeed:latest
+            image: docker.io/deepspeed/deepspeed:latest
             command: ["/bin/bash", "-c"]
             args:
               - |

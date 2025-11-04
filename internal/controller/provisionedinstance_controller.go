@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -253,6 +254,16 @@ func (r *ProvisionedInstanceReconciler) checkAndUpdateInstanceStatus(ctx context
 
 	instance, err := provisioner.GetInstance(ctx, zone, provisionedInstance.Status.InstanceName)
 	if err != nil {
+		// Check if it's a 404 (instance not found)
+		if strings.Contains(err.Error(), "notFound") || strings.Contains(err.Error(), "404") {
+			logger.Info("Instance not found in GCP, marking as TERMINATED")
+			provisionedInstance.Status.State = "TERMINATED"
+			provisionedInstance.Status.PreemptionNotice = true
+			if err := r.Status().Update(ctx, provisionedInstance); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
 		logger.Error(err, "Failed to get instance from GCP")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
@@ -261,6 +272,7 @@ func (r *ProvisionedInstanceReconciler) checkAndUpdateInstanceStatus(ctx context
 	if instance == nil {
 		logger.Info("Instance not found in GCP, marking as TERMINATED")
 		provisionedInstance.Status.State = "TERMINATED"
+		provisionedInstance.Status.PreemptionNotice = true
 		if err := r.Status().Update(ctx, provisionedInstance); err != nil {
 			return ctrl.Result{}, err
 		}

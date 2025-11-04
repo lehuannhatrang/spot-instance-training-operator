@@ -3,7 +3,7 @@ kind: InstanceTemplate
 metadata:
   name: testla-t4-1-gpu
 spec:
-  vmImage: "projects/criu-with-gpu-dcn/global/images/image-ubuntu-2404-gpu-580-v2"
+  vmImage: "projects/criu-with-gpu-dcn/global/images/image-ubuntu-2404-gpu-580-v3"
   gpu:
     type: "nvidia-tesla-t4"
     count: 1
@@ -17,9 +17,3 @@ spec:
   # Default: true
   preemptible: true
   
-  # Note: Nodes will auto-join cluster if 'kubeadm-join-token' secret exists in the namespace
-  # Create it with: kubectl create secret generic kubeadm-join-token \
-  #   --from-literal=token=<token> \
-  #   --from-literal=ca-cert-hash=<hash> \
-  #   --from-literal=control-plane-endpoint=<endpoint>
-

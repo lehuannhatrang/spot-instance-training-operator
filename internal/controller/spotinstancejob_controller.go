@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -229,10 +230,11 @@ func (r *SpotInstanceJobReconciler) reconcileProvisionedInstances(ctx context.Co
 		return err
 	}
 
-	// Count active instances (not terminated)
+	// Count active instances (not terminated and not being deleted)
 	activeInstances := 0
 	for _, pi := range provisionedInstanceList.Items {
-		if pi.Status.State != "TERMINATED" && pi.DeletionTimestamp.IsZero() {
+		// Count instances that are provisioning or running, not terminated or being deleted
+		if (pi.Status.State == "" || pi.Status.State == "PENDING" || pi.Status.State == "PROVISIONING" || pi.Status.State == "RUNNING") && pi.DeletionTimestamp.IsZero() {
 			activeInstances++
 		}
 	}
@@ -293,47 +295,60 @@ func (r *SpotInstanceJobReconciler) handlePreemption(ctx context.Context, spotIn
 		return err
 	}
 
+	// Track preempted instances that need replacement
+	preemptedInstances := []string{}
+
 	// Check for preempted instances
 	for _, pi := range provisionedInstanceList.Items {
-		if pi.Status.PreemptionNotice && pi.Status.NodeName != "" {
-			logger.Info("Detected preemption", "instance", pi.Name, "node", pi.Status.NodeName)
+		if pi.Status.PreemptionNotice && pi.Status.State == "TERMINATED" {
+			logger.Info("Detected preempted/terminated instance", "instance", pi.Name)
+			preemptedInstances = append(preemptedInstances, pi.Name)
 
-			// Find jobs on this node
-			jobs, err := r.findJobsOnNode(ctx, spotInstanceJob, pi.Status.NodeName)
-			if err != nil {
-				logger.Error(err, "Failed to find jobs on node", "node", pi.Status.NodeName)
-				continue
-			}
-
-			if len(jobs) == 0 {
-				logger.Info("No jobs on preempted node", "node", pi.Status.NodeName)
-				continue
-			}
-
-			// Count other active replicas
-			activeReplicas := 0
-			for _, otherPi := range provisionedInstanceList.Items {
-				if otherPi.Name != pi.Name && otherPi.Status.State == "RUNNING" && !otherPi.Status.PreemptionNotice {
-					activeReplicas++
+			// Find jobs on this node (if node still exists)
+			if pi.Status.NodeName != "" {
+				jobs, err := r.findJobsOnNode(ctx, spotInstanceJob, pi.Status.NodeName)
+				if err != nil {
+					logger.Error(err, "Failed to find jobs on node", "node", pi.Status.NodeName)
+					continue
 				}
-			}
 
-			if activeReplicas > 0 {
-				// Other replicas alive, create immediate checkpoint
-				logger.Info("Other replicas alive, creating immediate checkpoint", "jobs", jobs)
-				for _, jobName := range jobs {
-					if err := r.createCheckpointForJob(ctx, spotInstanceJob, jobName, true); err != nil {
-						logger.Error(err, "Failed to create checkpoint", "job", jobName)
+				if len(jobs) == 0 {
+					logger.Info("No jobs on preempted node", "node", pi.Status.NodeName)
+					continue
+				}
+
+				// Count other active replicas
+				activeReplicas := 0
+				for _, otherPi := range provisionedInstanceList.Items {
+					if otherPi.Name != pi.Name && otherPi.Status.State == "RUNNING" && !otherPi.Status.PreemptionNotice {
+						activeReplicas++
 					}
 				}
-			} else {
-				// No other replicas alive, restore from latest checkpoint
-				logger.Info("No other replicas alive, restoring from latest checkpoint", "jobs", jobs)
-				for _, jobName := range jobs {
-					go r.recreateJobFromLatestCheckpoint(context.Background(), spotInstanceJob, jobName)
+
+				if activeReplicas > 0 {
+					// Other replicas alive, create immediate checkpoint
+					logger.Info("Other replicas alive, creating immediate checkpoint", "jobs", jobs)
+					for _, jobName := range jobs {
+						if err := r.createCheckpointForJob(ctx, spotInstanceJob, jobName, true); err != nil {
+							logger.Error(err, "Failed to create checkpoint", "job", jobName)
+						}
+					}
+				} else {
+					// No other replicas alive, restore from latest checkpoint
+					logger.Info("No other replicas alive, restoring from latest checkpoint", "jobs", jobs)
+					for _, jobName := range jobs {
+						go r.recreateJobFromLatestCheckpoint(context.Background(), spotInstanceJob, jobName)
+					}
 				}
 			}
 		}
+	}
+
+	// Recreate ProvisionedInstances for terminated instances
+	if len(preemptedInstances) > 0 {
+		logger.Info("Recreating ProvisionedInstances for preempted instances", "count", len(preemptedInstances))
+		// The reconcileProvisionedInstances function will create new instances
+		// to replace the terminated ones in the next reconciliation loop
 	}
 
 	return nil
@@ -404,6 +419,61 @@ func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, 
 	for _, pod := range podList.Items {
 		checkpointName := fmt.Sprintf("%s-%s-%d", spotInstanceJob.Name, pod.Name, time.Now().Unix())
 
+		// Parse image repo to extract registry URL and repository
+		imageRepo := spotInstanceJob.Spec.CheckpointConfig.CheckpointImageRepo
+		registryURL := "docker.io"
+		repository := imageRepo
+
+		// Parse registry URL if provided (e.g., "docker.io/lehuannhatrang/gpu-checkpoints" or "gcr.io/project/repo")
+		if strings.Contains(imageRepo, "/") {
+			parts := strings.SplitN(imageRepo, "/", 2)
+			if len(parts) == 2 {
+				// Check if first part is a registry (contains dot or common registry names)
+				if strings.Contains(parts[0], ".") || parts[0] == "docker.io" || parts[0] == "gcr.io" || parts[0] == "ghcr.io" || parts[0] == "quay.io" {
+					registryURL = parts[0]
+					repository = parts[1]
+				}
+			}
+		}
+
+		spec := map[string]interface{}{
+			"schedule": "immediately",
+			"stopPod":  false,
+			"podRef": map[string]interface{}{
+				"name":      pod.Name,
+				"namespace": pod.Namespace,
+			},
+			"resourceRef": map[string]interface{}{
+				"apiVersion": "batch/v1",
+				"kind":       "Job",
+				"name":       jobName,
+				"namespace":  spotInstanceJob.Namespace,
+			},
+			"registry": map[string]interface{}{
+				"url":        registryURL,
+				"repository": repository,
+			},
+		}
+
+		// Add credential reference if provided
+		if spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef != nil {
+			registry := spec["registry"].(map[string]interface{})
+			registry["secretRef"] = map[string]interface{}{
+				"name":      spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef.Name,
+				"namespace": spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef.Namespace,
+			}
+		}
+
+		// Add containers section - include all containers from the pod
+		containers := []map[string]interface{}{}
+		for _, container := range pod.Spec.Containers {
+			containers = append(containers, map[string]interface{}{
+				"name":  container.Name,
+				"image": container.Image,
+			})
+		}
+		spec["containers"] = containers
+
 		checkpoint := &unstructured.Unstructured{
 			Object: map[string]interface{}{
 				"apiVersion": "migration.dcnlab.com/v1",
@@ -416,23 +486,8 @@ func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, 
 						"training.dcnlab.com/job": jobName,
 					},
 				},
-				"spec": map[string]interface{}{
-					"podName":        pod.Name,
-					"nodeName":       pod.Spec.NodeName,
-					"imageRepo":      spotInstanceJob.Spec.CheckpointConfig.CheckpointImageRepo,
-					"immediate":      immediate,
-					"containerIndex": 0,
-				},
+				"spec": spec,
 			},
-		}
-
-		// Add credential reference if provided
-		if spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef != nil {
-			spec := checkpoint.Object["spec"].(map[string]interface{})
-			spec["imageRepoCredentials"] = map[string]interface{}{
-				"name":      spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef.Name,
-				"namespace": spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef.Namespace,
-			}
 		}
 
 		if err := r.Create(ctx, checkpoint); err != nil {

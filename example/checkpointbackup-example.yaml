@@ -1,0 +1,32 @@
+apiVersion: migration.dcnlab.com/v1
+kind: CheckpointBackup
+metadata:
+  name: checkpoint-deepspeed
+  namespace: default
+spec:
+  # Use "immediately" to perform checkpoint once
+  schedule: "immediately"
+  
+  # Optional: Set to true to delete pod after checkpointing
+  stopPod: false
+  
+  podRef:
+    name: my-training-job-123
+    namespace: default
+  
+  resourceRef:
+    apiVersion: batch/v1
+    kind: Job
+    name: my-training-job
+    namespace: default
+
+  registry:
+    url: "docker.io"
+    repository: "lehuannhatrang/gpu-checkpoints"
+    secretRef:
+      name: backup-registry-lehuannhatrang-docker-1762182873
+      namespace: stateful-migration
+
+  containers:
+  - name: app-container
+    image: "lehuannhatrang/gpu-checkpoints:my-job-checkpoint"
