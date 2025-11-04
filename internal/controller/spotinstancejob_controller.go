@@ -112,9 +112,17 @@ func (r *SpotInstanceJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Reconcile ProvisionedInstances
-	if err := r.reconcileProvisionedInstances(ctx, spotInstanceJob, instanceTemplate); err != nil {
-		logger.Error(err, "Failed to reconcile provisioned instances")
-		return ctrl.Result{}, err
+	reconcileErr := r.reconcileProvisionedInstances(ctx, spotInstanceJob, instanceTemplate)
+	if reconcileErr != nil {
+		logger.Error(reconcileErr, "Failed to reconcile provisioned instances")
+		return ctrl.Result{}, reconcileErr
+	}
+
+	// Check if we're waiting for checkpoint completion
+	hasPendingCheckpoints, err := r.hasPendingCheckpoints(ctx, spotInstanceJob)
+	if err == nil && hasPendingCheckpoints {
+		logger.Info("Waiting for checkpoint completion (checkpoint typically takes 3-5 minutes)")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// Handle preemption
@@ -250,8 +258,9 @@ func (r *SpotInstanceJobReconciler) reconcileProvisionedInstances(ctx context.Co
 		if err != nil {
 			logger.Error(err, "Failed to check pending checkpoints")
 		} else if hasPendingCheckpoints {
-			logger.Info("Waiting for checkpoint completion before creating new ProvisionedInstances (checkpoint typically takes 3-5 minutes)")
-			return nil // Return nil to requeue, reconciliation will continue later
+			logger.Info("Pending checkpoints detected, will wait before creating new ProvisionedInstances")
+			// Return nil - the main Reconcile will handle requeuing
+			return nil
 		}
 	}
 
@@ -515,9 +524,47 @@ func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, 
 		return nil
 	}
 
-	// Create checkpoint for the first pod only (one CheckpointBackup per job)
-	pod := podList.Items[0]
-	checkpointName := fmt.Sprintf("%s-%s-%d", spotInstanceJob.Name, pod.Name, time.Now().Unix())
+	// Find first alive pod (pod with node that exists and is Ready)
+	var pod *corev1.Pod
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if p.Spec.NodeName == "" {
+			continue
+		}
+
+		// Check if node exists and is Ready
+		node := &corev1.Node{}
+		if err := r.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, node); err != nil {
+			if errors.IsNotFound(err) {
+				logger.Info("Pod node not found, skipping", "pod", p.Name, "node", p.Spec.NodeName)
+				continue
+			}
+			logger.Error(err, "Failed to get node", "node", p.Spec.NodeName)
+			continue
+		}
+
+		// Check if node is Ready
+		nodeReady := false
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+				nodeReady = true
+				break
+			}
+		}
+
+		if nodeReady {
+			pod = p
+			break
+		}
+	}
+
+	if pod == nil {
+		logger.Info("No alive pods found for job, skipping checkpoint", "job", jobName)
+		return nil
+	}
+
+	timestamp := time.Now().Unix()
+	checkpointName := fmt.Sprintf("%s-%s-%d", spotInstanceJob.Name, pod.Name, timestamp)
 
 	// Parse image repo to extract registry URL and repository
 	imageRepo := spotInstanceJob.Spec.CheckpointConfig.CheckpointImageRepo
@@ -565,11 +612,14 @@ func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, 
 	}
 
 	// Add containers section - include all containers from the pod
+	// Image format: {imageRepo}:{container_name}-{timestamp}
 	containers := []map[string]interface{}{}
 	for _, container := range pod.Spec.Containers {
+		// Format: {imageRepo}:{container_name}-{timestamp}
+		checkpointImage := fmt.Sprintf("%s:%s-%d", imageRepo, container.Name, timestamp)
 		containers = append(containers, map[string]interface{}{
 			"name":  container.Name,
-			"image": container.Image,
+			"image": checkpointImage,
 		})
 	}
 	spec["containers"] = containers
