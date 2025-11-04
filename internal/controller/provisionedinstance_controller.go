@@ -259,6 +259,15 @@ func (r *ProvisionedInstanceReconciler) checkAndUpdateInstanceStatus(ctx context
 			logger.Info("Instance not found in GCP, marking as TERMINATED")
 			provisionedInstance.Status.State = "TERMINATED"
 			provisionedInstance.Status.PreemptionNotice = true
+
+			// Delete the node if it exists
+			if provisionedInstance.Status.NodeName != "" {
+				if err := r.deleteNode(ctx, provisionedInstance.Status.NodeName); err != nil {
+					logger.Error(err, "Failed to delete node", "node", provisionedInstance.Status.NodeName)
+					// Continue anyway
+				}
+			}
+
 			if err := r.Status().Update(ctx, provisionedInstance); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -273,6 +282,15 @@ func (r *ProvisionedInstanceReconciler) checkAndUpdateInstanceStatus(ctx context
 		logger.Info("Instance not found in GCP, marking as TERMINATED")
 		provisionedInstance.Status.State = "TERMINATED"
 		provisionedInstance.Status.PreemptionNotice = true
+
+		// Delete the node if it exists
+		if provisionedInstance.Status.NodeName != "" {
+			if err := r.deleteNode(ctx, provisionedInstance.Status.NodeName); err != nil {
+				logger.Error(err, "Failed to delete node", "node", provisionedInstance.Status.NodeName)
+				// Continue anyway
+			}
+		}
+
 		if err := r.Status().Update(ctx, provisionedInstance); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -323,6 +341,7 @@ func (r *ProvisionedInstanceReconciler) updateInstanceStatus(ctx context.Context
 	// Detect preemption/termination
 	if instance.Status == "STOPPING" || instance.Status == "TERMINATED" {
 		provisionedInstance.Status.PreemptionNotice = true
+		provisionedInstance.Status.State = instance.Status
 		logger.Info("Instance is being preempted/terminated", "instance", instance.Name, "status", instance.Status)
 	}
 
@@ -330,9 +349,16 @@ func (r *ProvisionedInstanceReconciler) updateInstanceStatus(ctx context.Context
 		return ctrl.Result{}, err
 	}
 
-	// If instance is terminated, no need to requeue
+	// If instance is terminated, delete the node and no need to requeue
 	if instance.Status == "TERMINATED" {
 		logger.Info("Instance terminated", "instance", instance.Name)
+		// Delete the node if it exists
+		if provisionedInstance.Status.NodeName != "" {
+			if err := r.deleteNode(ctx, provisionedInstance.Status.NodeName); err != nil {
+				logger.Error(err, "Failed to delete node", "node", provisionedInstance.Status.NodeName)
+				// Continue anyway
+			}
+		}
 		return ctrl.Result{}, nil
 	}
 

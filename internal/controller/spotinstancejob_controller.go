@@ -232,10 +232,26 @@ func (r *SpotInstanceJobReconciler) reconcileProvisionedInstances(ctx context.Co
 
 	// Count active instances (not terminated and not being deleted)
 	activeInstances := 0
+	hasTerminatedInstances := false
 	for _, pi := range provisionedInstanceList.Items {
 		// Count instances that are provisioning or running, not terminated or being deleted
 		if (pi.Status.State == "" || pi.Status.State == "PENDING" || pi.Status.State == "PROVISIONING" || pi.Status.State == "RUNNING") && pi.DeletionTimestamp.IsZero() {
 			activeInstances++
+		}
+		if pi.Status.State == "TERMINATED" && pi.Status.PreemptionNotice {
+			hasTerminatedInstances = true
+		}
+	}
+
+	// If there are terminated instances, check if checkpoint is in progress before creating new instances
+	if hasTerminatedInstances && int32(activeInstances) < desiredReplicas {
+		// Check if there are pending checkpoints (wait for checkpoint completion before provisioning)
+		hasPendingCheckpoints, err := r.hasPendingCheckpoints(ctx, spotInstanceJob)
+		if err != nil {
+			logger.Error(err, "Failed to check pending checkpoints")
+		} else if hasPendingCheckpoints {
+			logger.Info("Waiting for checkpoint completion before creating new ProvisionedInstances (checkpoint typically takes 3-5 minutes)")
+			return nil // Return nil to requeue, reconciliation will continue later
 		}
 	}
 
@@ -281,6 +297,47 @@ func (r *SpotInstanceJobReconciler) reconcileProvisionedInstances(ctx context.Co
 	}
 
 	return nil
+}
+
+// hasPendingCheckpoints checks if there are any pending or in-progress checkpoints for the SpotInstanceJob
+func (r *SpotInstanceJobReconciler) hasPendingCheckpoints(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob) (bool, error) {
+	// List all CheckpointBackup CRs for this SpotInstanceJob
+	checkpoints := &unstructured.UnstructuredList{}
+	checkpoints.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "migration.dcnlab.com",
+		Version: "v1",
+		Kind:    "CheckpointBackupList",
+	})
+
+	labelSelector := client.MatchingLabels{
+		spotInstanceJobLabel: spotInstanceJob.Name,
+	}
+	if err := r.List(ctx, checkpoints, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err != nil {
+		return false, err
+	}
+
+	// Check if any checkpoint is in progress (not in terminal state)
+	for _, cp := range checkpoints.Items {
+		status, found, _ := unstructured.NestedMap(cp.Object, "status")
+		if found {
+			phase, found, _ := unstructured.NestedString(status, "phase")
+			if found {
+				// Terminal states: PhaseCompleted, PhaseCompletedPodDeleted, PhaseCompletedWithError, PhaseFailed
+				// In-progress states: everything else
+				if phase != "Completed" && phase != "CompletedPodDeleted" && phase != "CompletedWithError" && phase != "Failed" {
+					return true, nil
+				}
+			} else {
+				// Phase not set yet, assume it's pending/in-progress
+				return true, nil
+			}
+		} else {
+			// Status not set yet, assume it's pending/in-progress
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // handlePreemption checks for preempted instances and handles them appropriately
@@ -402,6 +459,44 @@ func (r *SpotInstanceJobReconciler) findJobsOnNode(ctx context.Context, spotInst
 func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, jobName string, immediate bool) error {
 	logger := log.FromContext(ctx)
 
+	// Check if a CheckpointBackup already exists for this job
+	checkpoints := &unstructured.UnstructuredList{}
+	checkpoints.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "migration.dcnlab.com",
+		Version: "v1",
+		Kind:    "CheckpointBackupList",
+	})
+
+	labelSelector := client.MatchingLabels{
+		"training.dcnlab.com/job": jobName,
+	}
+	if err := r.List(ctx, checkpoints, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err == nil {
+		// Check if there's already an in-progress checkpoint
+		for _, cp := range checkpoints.Items {
+			status, found, _ := unstructured.NestedMap(cp.Object, "status")
+			if found {
+				phase, found, _ := unstructured.NestedString(status, "phase")
+				if found {
+					// Check if checkpoint is in progress (not in terminal state)
+					// Terminal states: PhaseCompleted, PhaseCompletedPodDeleted, PhaseCompletedWithError, PhaseFailed
+					// In-progress states: PhaseCheckpointing, PhaseCheckpointed, PhaseImageBuilding, PhaseImageBuilt, PhaseImagePushing, PhaseImagePushed
+					if phase != "Completed" && phase != "CompletedPodDeleted" && phase != "CompletedWithError" && phase != "Failed" {
+						logger.Info("CheckpointBackup already exists for job and is in progress", "job", jobName, "checkpoint", cp.GetName(), "phase", phase)
+						return nil
+					}
+				} else {
+					// Phase not set yet, assume it's pending/in-progress
+					logger.Info("CheckpointBackup already exists for job (phase not set yet)", "job", jobName, "checkpoint", cp.GetName())
+					return nil
+				}
+			} else {
+				// Status not set yet, assume it's pending/in-progress
+				logger.Info("CheckpointBackup already exists for job (no status yet)", "job", jobName, "checkpoint", cp.GetName())
+				return nil
+			}
+		}
+	}
+
 	// List pods for the job
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
@@ -415,99 +510,104 @@ func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, 
 		}
 	}
 
-	// Create checkpoint for each pod
-	for _, pod := range podList.Items {
-		checkpointName := fmt.Sprintf("%s-%s-%d", spotInstanceJob.Name, pod.Name, time.Now().Unix())
+	if len(podList.Items) == 0 {
+		logger.Info("No pods found for job, skipping checkpoint", "job", jobName)
+		return nil
+	}
 
-		// Parse image repo to extract registry URL and repository
-		imageRepo := spotInstanceJob.Spec.CheckpointConfig.CheckpointImageRepo
-		registryURL := "docker.io"
-		repository := imageRepo
+	// Create checkpoint for the first pod only (one CheckpointBackup per job)
+	pod := podList.Items[0]
+	checkpointName := fmt.Sprintf("%s-%s-%d", spotInstanceJob.Name, pod.Name, time.Now().Unix())
 
-		// Parse registry URL if provided (e.g., "docker.io/lehuannhatrang/gpu-checkpoints" or "gcr.io/project/repo")
-		if strings.Contains(imageRepo, "/") {
-			parts := strings.SplitN(imageRepo, "/", 2)
-			if len(parts) == 2 {
-				// Check if first part is a registry (contains dot or common registry names)
-				if strings.Contains(parts[0], ".") || parts[0] == "docker.io" || parts[0] == "gcr.io" || parts[0] == "ghcr.io" || parts[0] == "quay.io" {
-					registryURL = parts[0]
-					repository = parts[1]
-				}
+	// Parse image repo to extract registry URL and repository
+	imageRepo := spotInstanceJob.Spec.CheckpointConfig.CheckpointImageRepo
+	registryURL := "docker.io"
+	repository := imageRepo
+
+	// Parse registry URL if provided (e.g., "docker.io/lehuannhatrang/gpu-checkpoints" or "gcr.io/project/repo")
+	if strings.Contains(imageRepo, "/") {
+		parts := strings.SplitN(imageRepo, "/", 2)
+		if len(parts) == 2 {
+			// Check if first part is a registry (contains dot or common registry names)
+			if strings.Contains(parts[0], ".") || parts[0] == "docker.io" || parts[0] == "gcr.io" || parts[0] == "ghcr.io" || parts[0] == "quay.io" {
+				registryURL = parts[0]
+				repository = parts[1]
 			}
 		}
+	}
 
-		spec := map[string]interface{}{
-			"schedule": "immediately",
-			"stopPod":  false,
-			"podRef": map[string]interface{}{
-				"name":      pod.Name,
-				"namespace": pod.Namespace,
-			},
-			"resourceRef": map[string]interface{}{
-				"apiVersion": "batch/v1",
-				"kind":       "Job",
-				"name":       jobName,
-				"namespace":  spotInstanceJob.Namespace,
-			},
-			"registry": map[string]interface{}{
-				"url":        registryURL,
-				"repository": repository,
-			},
+	spec := map[string]interface{}{
+		"schedule": "immediately",
+		"stopPod":  false,
+		"podRef": map[string]interface{}{
+			"name":      pod.Name,
+			"namespace": pod.Namespace,
+		},
+		"resourceRef": map[string]interface{}{
+			"apiVersion": "batch/v1",
+			"kind":       "Job",
+			"name":       jobName,
+			"namespace":  spotInstanceJob.Namespace,
+		},
+		"registry": map[string]interface{}{
+			"url":        registryURL,
+			"repository": repository,
+		},
+	}
+
+	// Add credential reference if provided
+	if spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef != nil {
+		registry := spec["registry"].(map[string]interface{})
+		registry["secretRef"] = map[string]interface{}{
+			"name":      spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef.Name,
+			"namespace": spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef.Namespace,
 		}
+	}
 
-		// Add credential reference if provided
-		if spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef != nil {
-			registry := spec["registry"].(map[string]interface{})
-			registry["secretRef"] = map[string]interface{}{
-				"name":      spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef.Name,
-				"namespace": spotInstanceJob.Spec.CheckpointConfig.CheckpointRepoCredentialRef.Namespace,
-			}
-		}
+	// Add containers section - include all containers from the pod
+	containers := []map[string]interface{}{}
+	for _, container := range pod.Spec.Containers {
+		containers = append(containers, map[string]interface{}{
+			"name":  container.Name,
+			"image": container.Image,
+		})
+	}
+	spec["containers"] = containers
 
-		// Add containers section - include all containers from the pod
-		containers := []map[string]interface{}{}
-		for _, container := range pod.Spec.Containers {
-			containers = append(containers, map[string]interface{}{
-				"name":  container.Name,
-				"image": container.Image,
-			})
-		}
-		spec["containers"] = containers
-
-		checkpoint := &unstructured.Unstructured{
-			Object: map[string]interface{}{
-				"apiVersion": "migration.dcnlab.com/v1",
-				"kind":       "CheckpointBackup",
-				"metadata": map[string]interface{}{
-					"name":      checkpointName,
-					"namespace": spotInstanceJob.Namespace,
-					"labels": map[string]interface{}{
-						spotInstanceJobLabel:      spotInstanceJob.Name,
-						"training.dcnlab.com/job": jobName,
-					},
+	checkpoint := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "migration.dcnlab.com/v1",
+			"kind":       "CheckpointBackup",
+			"metadata": map[string]interface{}{
+				"name":      checkpointName,
+				"namespace": spotInstanceJob.Namespace,
+				"labels": map[string]interface{}{
+					spotInstanceJobLabel:      spotInstanceJob.Name,
+					"training.dcnlab.com/job": jobName,
 				},
-				"spec": spec,
 			},
-		}
+			"spec": spec,
+		},
+	}
 
-		if err := r.Create(ctx, checkpoint); err != nil {
-			if errors.IsAlreadyExists(err) {
-				logger.Info("CheckpointBackup already exists", "name", checkpointName)
-				continue
-			}
-			return err
-		} else {
-			logger.Info("Created CheckpointBackup CR",
-				"name", checkpointName,
-				"pod", pod.Name,
-				"node", pod.Spec.NodeName,
-				"immediate", immediate)
-
-			// If immediate checkpoint, wait for completion and recreate job
-			if immediate {
-				go r.waitForCheckpointAndRecreateJob(context.Background(), spotInstanceJob, jobName)
-			}
+	if err := r.Create(ctx, checkpoint); err != nil {
+		if errors.IsAlreadyExists(err) {
+			logger.Info("CheckpointBackup already exists", "name", checkpointName)
+			return nil
 		}
+		return err
+	}
+
+	logger.Info("Created CheckpointBackup CR",
+		"name", checkpointName,
+		"pod", pod.Name,
+		"node", pod.Spec.NodeName,
+		"job", jobName,
+		"immediate", immediate)
+
+	// If immediate checkpoint, wait for completion and recreate job
+	if immediate {
+		go r.waitForCheckpointAndRecreateJob(context.Background(), spotInstanceJob, jobName)
 	}
 
 	return nil
@@ -518,12 +618,12 @@ func (r *SpotInstanceJobReconciler) waitForCheckpointAndRecreateJob(ctx context.
 	logger := log.FromContext(ctx)
 	logger.Info("Waiting for checkpoint completion", "job", oldJobName)
 
-	// Wait up to 10 minutes for checkpoint
+	// Wait up to 10 minutes for checkpoint (typically takes 3-5 minutes)
 	timeout := time.After(10 * time.Minute)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	var checkpointImage string
+	var checkpointContainers []map[string]interface{}
 	for {
 		select {
 		case <-timeout:
@@ -546,7 +646,8 @@ func (r *SpotInstanceJobReconciler) waitForCheckpointAndRecreateJob(ctx context.
 				continue
 			}
 
-			// Find completed checkpoint
+			// Find completed checkpoint (PhaseCompleted or PhaseCompletedPodDeleted)
+			var foundContainers []map[string]interface{}
 			for _, cp := range checkpoints.Items {
 				status, found, _ := unstructured.NestedMap(cp.Object, "status")
 				if !found {
@@ -554,25 +655,32 @@ func (r *SpotInstanceJobReconciler) waitForCheckpointAndRecreateJob(ctx context.
 				}
 
 				phase, found, _ := unstructured.NestedString(status, "phase")
-				if found && phase == "Completed" {
-					img, found, _ := unstructured.NestedString(status, "checkpointImage")
-					if found {
-						checkpointImage = img
+				if found && (phase == "Completed" || phase == "CompletedPodDeleted") {
+					// Extract containers array from status
+					containers, found, _ := unstructured.NestedSlice(status, "containers")
+					if found && len(containers) > 0 {
+						foundContainers = make([]map[string]interface{}, len(containers))
+						for i, c := range containers {
+							if containerMap, ok := c.(map[string]interface{}); ok {
+								foundContainers[i] = containerMap
+							}
+						}
 						break
 					}
 				}
 			}
 
-			if checkpointImage != "" {
-				logger.Info("Checkpoint completed", "job", oldJobName, "image", checkpointImage)
+			if len(foundContainers) > 0 {
+				checkpointContainers = foundContainers
+				logger.Info("Checkpoint completed", "job", oldJobName, "containers", len(checkpointContainers))
 
 				// Delete old job
 				if err := r.deleteJob(ctx, spotInstanceJob.Namespace, oldJobName); err != nil {
 					logger.Error(err, "Failed to delete old job", "job", oldJobName)
 				}
 
-				// Recreate job with checkpoint image
-				if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, checkpointImage); err != nil {
+				// Recreate job with checkpoint images
+				if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, checkpointContainers); err != nil {
 					logger.Error(err, "Failed to recreate job", "job", oldJobName)
 				}
 				return
@@ -602,8 +710,8 @@ func (r *SpotInstanceJobReconciler) recreateJobFromLatestCheckpoint(ctx context.
 		return
 	}
 
-	// Find latest completed checkpoint
-	var latestImage string
+	// Find latest completed checkpoint (PhaseCompleted or PhaseCompletedPodDeleted)
+	var latestContainers []map[string]interface{}
 	var latestTime time.Time
 
 	for _, cp := range checkpoints.Items {
@@ -613,7 +721,7 @@ func (r *SpotInstanceJobReconciler) recreateJobFromLatestCheckpoint(ctx context.
 		}
 
 		phase, found, _ := unstructured.NestedString(status, "phase")
-		if !found || phase != "Completed" {
+		if !found || (phase != "Completed" && phase != "CompletedPodDeleted") {
 			continue
 		}
 
@@ -627,25 +735,31 @@ func (r *SpotInstanceJobReconciler) recreateJobFromLatestCheckpoint(ctx context.
 			continue
 		}
 
-		if latestImage == "" || completionTime.After(latestTime) {
-			img, found, _ := unstructured.NestedString(status, "checkpointImage")
-			if found {
-				latestImage = img
+		// Extract containers array from status
+		containers, found, _ := unstructured.NestedSlice(status, "containers")
+		if found && len(containers) > 0 {
+			if latestContainers == nil || completionTime.After(latestTime) {
+				latestContainers = make([]map[string]interface{}, len(containers))
+				for i, c := range containers {
+					if containerMap, ok := c.(map[string]interface{}); ok {
+						latestContainers[i] = containerMap
+					}
+				}
 				latestTime = completionTime
 			}
 		}
 	}
 
-	if latestImage == "" {
+	if len(latestContainers) == 0 {
 		logger.Info("No completed checkpoint found, recreating without checkpoint", "job", oldJobName)
 		// Recreate without checkpoint
-		if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, ""); err != nil {
+		if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, nil); err != nil {
 			logger.Error(err, "Failed to recreate job", "job", oldJobName)
 		}
 		return
 	}
 
-	logger.Info("Found latest checkpoint", "job", oldJobName, "image", latestImage)
+	logger.Info("Found latest checkpoint", "job", oldJobName, "containers", len(latestContainers))
 
 	// Delete old job
 	if err := r.deleteJob(ctx, spotInstanceJob.Namespace, oldJobName); err != nil {
@@ -653,7 +767,7 @@ func (r *SpotInstanceJobReconciler) recreateJobFromLatestCheckpoint(ctx context.
 	}
 
 	// Recreate job with checkpoint
-	if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, latestImage); err != nil {
+	if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, latestContainers); err != nil {
 		logger.Error(err, "Failed to recreate job", "job", oldJobName)
 	}
 }
@@ -671,8 +785,8 @@ func (r *SpotInstanceJobReconciler) deleteJob(ctx context.Context, namespace, jo
 	return r.Delete(ctx, job)
 }
 
-// recreateJobWithCheckpoint recreates a job with optional checkpoint image
-func (r *SpotInstanceJobReconciler) recreateJobWithCheckpoint(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, oldJobName, checkpointImage string) error {
+// recreateJobWithCheckpoint recreates a job with optional checkpoint container images
+func (r *SpotInstanceJobReconciler) recreateJobWithCheckpoint(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, oldJobName string, checkpointContainers []map[string]interface{}) error {
 	logger := log.FromContext(ctx)
 
 	// Generate new job name
@@ -697,12 +811,27 @@ func (r *SpotInstanceJobReconciler) recreateJobWithCheckpoint(ctx context.Contex
 	}
 	job.Spec.Template.Labels[spotInstanceJobLabel] = spotInstanceJob.Name
 
-	// If checkpoint image provided, update container image
-	if checkpointImage != "" {
-		if len(job.Spec.Template.Spec.Containers) > 0 {
-			job.Spec.Template.Spec.Containers[0].Image = checkpointImage
-			logger.Info("Recreating job with checkpoint image", "job", newJobName, "image", checkpointImage)
+	// If checkpoint containers provided, update container images
+	if len(checkpointContainers) > 0 {
+		// Create a map of container name -> checkpoint image
+		checkpointImageMap := make(map[string]string)
+		for _, c := range checkpointContainers {
+			if name, ok := c["name"].(string); ok {
+				if image, ok := c["image"].(string); ok {
+					checkpointImageMap[name] = image
+				}
+			}
 		}
+
+		// Update container images in the job
+		for i := range job.Spec.Template.Spec.Containers {
+			containerName := job.Spec.Template.Spec.Containers[i].Name
+			if checkpointImage, found := checkpointImageMap[containerName]; found {
+				job.Spec.Template.Spec.Containers[i].Image = checkpointImage
+				logger.Info("Updating container with checkpoint image", "container", containerName, "image", checkpointImage)
+			}
+		}
+		logger.Info("Recreating job with checkpoint images", "job", newJobName, "containers", len(checkpointContainers))
 	} else {
 		logger.Info("Recreating job without checkpoint", "job", newJobName)
 	}
@@ -717,7 +846,7 @@ func (r *SpotInstanceJobReconciler) recreateJobWithCheckpoint(ctx context.Contex
 		return err
 	}
 
-	logger.Info("Successfully recreated job", "oldJob", oldJobName, "newJob", newJobName, "checkpointImage", checkpointImage)
+	logger.Info("Successfully recreated job", "oldJob", oldJobName, "newJob", newJobName, "containers", len(checkpointContainers))
 	return nil
 }
 
