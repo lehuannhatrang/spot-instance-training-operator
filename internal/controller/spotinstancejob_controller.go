@@ -393,11 +393,70 @@ func (r *SpotInstanceJobReconciler) handlePreemption(ctx context.Context, spotIn
 
 				if activeReplicas > 0 {
 					// Other replicas alive, create immediate checkpoint
-					logger.Info("Other replicas alive, creating immediate checkpoint", "jobs", jobs)
-					for _, jobName := range jobs {
-						if err := r.createCheckpointForJob(ctx, spotInstanceJob, jobName, true); err != nil {
-							logger.Error(err, "Failed to create checkpoint", "job", jobName)
+					// Find a pod from this SpotInstanceJob that's running on an alive node and checkpoint that
+					// (Don't checkpoint pods from jobs on the preempted node since those nodes are gone)
+					logger.Info("Other replicas alive, creating immediate checkpoint for a pod on alive node")
+
+					// Find all pods belonging to this SpotInstanceJob
+					podList := &corev1.PodList{}
+					if err := r.List(ctx, podList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
+						spotInstanceJobLabel: spotInstanceJob.Name,
+					}); err != nil {
+						logger.Error(err, "Failed to list pods for SpotInstanceJob")
+						continue
+					}
+
+					// Find first alive pod (on a node that exists and is Ready)
+					var alivePod *corev1.Pod
+					for i := range podList.Items {
+						p := &podList.Items[i]
+						if p.Spec.NodeName == "" {
+							continue
 						}
+
+						// Check if node exists and is Ready
+						node := &corev1.Node{}
+						if err := r.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, node); err != nil {
+							if errors.IsNotFound(err) {
+								continue
+							}
+							logger.Error(err, "Failed to get node", "node", p.Spec.NodeName)
+							continue
+						}
+
+						// Check if node is Ready
+						nodeReady := false
+						for _, condition := range node.Status.Conditions {
+							if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+								nodeReady = true
+								break
+							}
+						}
+
+						if nodeReady {
+							alivePod = p
+							break
+						}
+					}
+
+					if alivePod != nil {
+						// Get job name from pod labels
+						jobName := ""
+						if name, ok := alivePod.Labels["job-name"]; ok {
+							jobName = name
+						} else if name, ok := alivePod.Labels["batch.kubernetes.io/job-name"]; ok {
+							jobName = name
+						}
+
+						if jobName != "" {
+							if err := r.createCheckpointForJob(ctx, spotInstanceJob, jobName, true); err != nil {
+								logger.Error(err, "Failed to create checkpoint", "job", jobName)
+							}
+						} else {
+							logger.Info("Could not determine job name from pod labels", "pod", alivePod.Name)
+						}
+					} else {
+						logger.Info("No alive pods found for SpotInstanceJob", "spotInstanceJob", spotInstanceJob.Name)
 					}
 				} else {
 					// No other replicas alive, restore from latest checkpoint
