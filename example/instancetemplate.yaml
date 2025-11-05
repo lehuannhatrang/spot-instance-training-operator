@@ -3,14 +3,14 @@ kind: InstanceTemplate
 metadata:
   name: testla-t4-1-gpu
 spec:
-  vmImage: "projects/criu-with-gpu-dcn/global/images/image-ubuntu-2404-gpu-580-v3"
+  vmImage: "projects/criu-with-gpu-dcn/global/images/image-ubuntu-2404-gpu-580-v4"
   gpu:
     type: "nvidia-tesla-t4"
     count: 1
   gcp:
     project: "criu-with-gpu-dcn"
     zone: "asia-northeast3-c"
-    machineType: "n1-standard-4"
+    machineType: "n1-standard-8"
     diskSizeGB: 100
   
   # Preemptible determines whether to use spot instances (true) or on-demand (false)
