@@ -12,6 +12,7 @@ spec:
     zone: "asia-northeast3-c"
     machineType: "n1-standard-8"
     diskSizeGB: 100
+    diskType: "pd-ssd"
   
   # Preemptible determines whether to use spot instances (true) or on-demand (false)
   # Default: true

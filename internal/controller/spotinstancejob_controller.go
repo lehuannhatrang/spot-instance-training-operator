@@ -66,7 +66,6 @@ type SpotInstanceJobReconciler struct {
 // Reconcile is part of the main kubernetes reconciliation loop
 func (r *SpotInstanceJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Reconciling SpotInstanceJob", "name", req.Name, "namespace", req.Namespace)
 
 	// Fetch the SpotInstanceJob
 	spotInstanceJob := &trainingv1alpha1.SpotInstanceJob{}
@@ -111,30 +110,47 @@ func (r *SpotInstanceJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	// Reconcile ProvisionedInstances
-	reconcileErr := r.reconcileProvisionedInstances(ctx, spotInstanceJob, instanceTemplate)
-	if reconcileErr != nil {
-		logger.Error(reconcileErr, "Failed to reconcile provisioned instances")
-		return ctrl.Result{}, reconcileErr
+	// Handle preemption FIRST (this will create checkpoints if preemption is detected)
+
+	pendingCheckpoints, err := r.hasPendingCheckpoints(ctx, spotInstanceJob)
+	if err != nil {
+		logger.Error(err, "Failed to check pending checkpoints")
+		// Continue with reconciliation even if check failed
+	} else if !pendingCheckpoints {
+		// No pending checkpoints, safe to handle preemption
+		if err := r.handlePreemption(ctx, spotInstanceJob); err != nil {
+			logger.Error(err, "Failed to handle preemption")
+			return ctrl.Result{}, err
+		}
 	}
 
-	// Check if we're waiting for checkpoint completion
+	// Check if we're waiting for checkpoint completion AFTER handling preemption
+	// (preemption handling may have just created a checkpoint)
 	hasPendingCheckpoints, err := r.hasPendingCheckpoints(ctx, spotInstanceJob)
-	if err == nil && hasPendingCheckpoints {
-		logger.Info("Waiting for checkpoint completion (checkpoint typically takes 3-5 minutes)")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-
-	// Handle preemption
-	if err := r.handlePreemption(ctx, spotInstanceJob); err != nil {
-		logger.Error(err, "Failed to handle preemption")
-		return ctrl.Result{}, err
+	if err != nil {
+		logger.Error(err, "Failed to check pending checkpoints")
+		// Continue with reconciliation even if check failed
+	} else if hasPendingCheckpoints {
+		logger.Info("Waiting for checkpoint completion before creating new ProvisionedInstances (checkpoint typically takes 3-5 minutes)")
+		// Skip ProvisionedInstance creation while checkpoint is in progress
+	} else {
+		// No pending checkpoints, safe to reconcile ProvisionedInstances
+		reconcileErr := r.reconcileProvisionedInstances(ctx, spotInstanceJob, instanceTemplate)
+		if reconcileErr != nil {
+			logger.Error(reconcileErr, "Failed to reconcile provisioned instances")
+			return ctrl.Result{}, reconcileErr
+		}
 	}
 
 	// Update status
 	if err := r.updateStatus(ctx, spotInstanceJob); err != nil {
 		logger.Error(err, "Failed to update status")
 		return ctrl.Result{}, err
+	}
+
+	// Requeue more frequently if waiting for checkpoint completion
+	if hasPendingCheckpoints {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
@@ -267,7 +283,6 @@ func (r *SpotInstanceJobReconciler) reconcileProvisionedInstances(ctx context.Co
 	// Create missing ProvisionedInstances
 	if int32(activeInstances) < desiredReplicas {
 		needed := desiredReplicas - int32(activeInstances)
-		logger.Info("Creating ProvisionedInstances", "needed", needed)
 
 		for i := int32(0); i < needed; i++ {
 			instanceName := fmt.Sprintf("%s-%s-%d-%d",
@@ -349,6 +364,84 @@ func (r *SpotInstanceJobReconciler) hasPendingCheckpoints(ctx context.Context, s
 	return false, nil
 }
 
+// hasCompletedCheckpoint checks if there's at least one completed checkpoint for the SpotInstanceJob
+// Returns: (hasCompleted, completedRecently, error)
+// completedRecently is true if the checkpoint was completed within the last 5 minutes
+func (r *SpotInstanceJobReconciler) hasCompletedCheckpoint(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob) (bool, bool, error) {
+	// List all CheckpointBackup CRs for this SpotInstanceJob
+	checkpoints := &unstructured.UnstructuredList{}
+	checkpoints.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "migration.dcnlab.com",
+		Version: "v1",
+		Kind:    "CheckpointBackupList",
+	})
+
+	labelSelector := client.MatchingLabels{
+		spotInstanceJobLabel: spotInstanceJob.Name,
+	}
+	if err := r.List(ctx, checkpoints, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err != nil {
+		return false, false, err
+	}
+
+	now := time.Now()
+	recentThreshold := 5 * time.Minute
+	hasCompleted := false
+	completedRecently := false
+
+	// Check if any checkpoint is completed (successful completion)
+	for _, cp := range checkpoints.Items {
+		status, found, _ := unstructured.NestedMap(cp.Object, "status")
+		if found {
+			phase, found, _ := unstructured.NestedString(status, "phase")
+			if found {
+				// Check for successful completion states
+				if phase == "Completed" || phase == "CompletedPodDeleted" {
+					hasCompleted = true
+
+					// Check completion time to see if it was recent
+					completionTimeStr, found, _ := unstructured.NestedString(status, "completionTime")
+					if found {
+						completionTime, err := time.Parse(time.RFC3339, completionTimeStr)
+						if err == nil {
+							if now.Sub(completionTime) < recentThreshold {
+								completedRecently = true
+							}
+						}
+					} else {
+						// If no completionTime, check creation time
+						creationTime := cp.GetCreationTimestamp()
+						if now.Sub(creationTime.Time) < recentThreshold {
+							completedRecently = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return hasCompleted, completedRecently, nil
+}
+
+// hasRestoredJobs checks if there are any jobs with "restored-from" label, indicating they were recreated from a checkpoint
+func (r *SpotInstanceJobReconciler) hasRestoredJobs(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob) (bool, error) {
+	// List all jobs belonging to this SpotInstanceJob
+	jobList := &batchv1.JobList{}
+	if err := r.List(ctx, jobList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
+		spotInstanceJobLabel: spotInstanceJob.Name,
+	}); err != nil {
+		return false, err
+	}
+
+	// Check if any job has "restored-from" label
+	for _, job := range jobList.Items {
+		if _, ok := job.Labels["restored-from"]; ok {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 // handlePreemption checks for preempted instances and handles them appropriately
 func (r *SpotInstanceJobReconciler) handlePreemption(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob) error {
 	logger := log.FromContext(ctx)
@@ -366,103 +459,128 @@ func (r *SpotInstanceJobReconciler) handlePreemption(ctx context.Context, spotIn
 
 	// Check for preempted instances
 	for _, pi := range provisionedInstanceList.Items {
-		if pi.Status.PreemptionNotice && pi.Status.State == "TERMINATED" {
+		if pi.Status.PreemptionNotice || pi.Status.State == "TERMINATED" || pi.Status.State == "STOPPING" {
 			logger.Info("Detected preempted/terminated instance", "instance", pi.Name)
 			preemptedInstances = append(preemptedInstances, pi.Name)
 
-			// Find jobs on this node (if node still exists)
-			if pi.Status.NodeName != "" {
-				jobs, err := r.findJobsOnNode(ctx, spotInstanceJob, pi.Status.NodeName)
+			// Count other active replicas
+			activeReplicas := 0
+			for _, otherPi := range provisionedInstanceList.Items {
+				if otherPi.Name != pi.Name && otherPi.Status.State == "RUNNING" && !otherPi.Status.PreemptionNotice {
+					activeReplicas++
+				}
+			}
+
+			if activeReplicas > 0 {
+				// Other replicas alive, check if we've already handled this preemption
+				// Check if there's already a completed checkpoint for this SpotInstanceJob
+				hasCompletedCheckpoint, completedRecently, err := r.hasCompletedCheckpoint(ctx, spotInstanceJob)
 				if err != nil {
-					logger.Error(err, "Failed to find jobs on node", "node", pi.Status.NodeName)
-					continue
-				}
-
-				if len(jobs) == 0 {
-					logger.Info("No jobs on preempted node", "node", pi.Status.NodeName)
-					continue
-				}
-
-				// Count other active replicas
-				activeReplicas := 0
-				for _, otherPi := range provisionedInstanceList.Items {
-					if otherPi.Name != pi.Name && otherPi.Status.State == "RUNNING" && !otherPi.Status.PreemptionNotice {
-						activeReplicas++
+					logger.Error(err, "Failed to check for completed checkpoint")
+				} else if hasCompletedCheckpoint {
+					// Check if jobs were already recreated (have "restored-from" label)
+					hasRestoredJobs, err := r.hasRestoredJobs(ctx, spotInstanceJob)
+					if err != nil {
+						logger.Error(err, "Failed to check for restored jobs")
+					} else if hasRestoredJobs {
+						// Checkpoint completed and jobs were recreated, skip creating new checkpoint
+						logger.Info("Checkpoint already completed and jobs recreated for preempted instance, skipping", "instance", pi.Name)
+						continue
+					} else if completedRecently {
+						// Checkpoint completed recently but jobs not recreated yet, wait a bit
+						// This prevents creating duplicate checkpoints while job recreation is in progress
+						logger.Info("Checkpoint completed recently, waiting for job recreation before creating new checkpoint", "instance", pi.Name)
+						continue
 					}
 				}
 
-				if activeReplicas > 0 {
-					// Other replicas alive, create immediate checkpoint
-					// Find a pod from this SpotInstanceJob that's running on an alive node and checkpoint that
-					// (Don't checkpoint pods from jobs on the preempted node since those nodes are gone)
-					logger.Info("Other replicas alive, creating immediate checkpoint for a pod on alive node")
+				// Other replicas alive, create immediate checkpoint
+				// Find a pod from this SpotInstanceJob that's running on an alive node and checkpoint that
+				// (Don't checkpoint pods from jobs on the preempted node since those nodes are gone)
+				logger.Info("Other replicas alive, creating immediate checkpoint for a pod on alive node")
 
-					// Find all pods belonging to this SpotInstanceJob
-					podList := &corev1.PodList{}
-					if err := r.List(ctx, podList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
-						spotInstanceJobLabel: spotInstanceJob.Name,
-					}); err != nil {
-						logger.Error(err, "Failed to list pods for SpotInstanceJob")
+				// Find all pods belonging to this SpotInstanceJob
+				podList := &corev1.PodList{}
+				if err := r.List(ctx, podList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
+					spotInstanceJobLabel: spotInstanceJob.Name,
+				}); err != nil {
+					logger.Error(err, "Failed to list pods for SpotInstanceJob")
+					continue
+				}
+
+				// Find first alive pod (on a node that exists and is Ready)
+				// Skip pods on the preempted node
+				var alivePod *corev1.Pod
+				for i := range podList.Items {
+					p := &podList.Items[i]
+					if p.Spec.NodeName == "" {
 						continue
 					}
 
-					// Find first alive pod (on a node that exists and is Ready)
-					var alivePod *corev1.Pod
-					for i := range podList.Items {
-						p := &podList.Items[i]
-						if p.Spec.NodeName == "" {
+					// Skip pods on the preempted node
+					if pi.Status.NodeName != "" && p.Spec.NodeName == pi.Status.NodeName {
+						logger.Info("Skipping pod on preempted node", "pod", p.Name, "node", p.Spec.NodeName)
+						continue
+					}
+
+					// Check if node exists and is Ready
+					node := &corev1.Node{}
+					if err := r.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, node); err != nil {
+						if errors.IsNotFound(err) {
+							logger.Info("Pod node not found, skipping", "pod", p.Name, "node", p.Spec.NodeName)
 							continue
 						}
+						logger.Error(err, "Failed to get node", "node", p.Spec.NodeName)
+						continue
+					}
 
-						// Check if node exists and is Ready
-						node := &corev1.Node{}
-						if err := r.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, node); err != nil {
-							if errors.IsNotFound(err) {
-								continue
-							}
-							logger.Error(err, "Failed to get node", "node", p.Spec.NodeName)
-							continue
-						}
-
-						// Check if node is Ready
-						nodeReady := false
-						for _, condition := range node.Status.Conditions {
-							if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-								nodeReady = true
-								break
-							}
-						}
-
-						if nodeReady {
-							alivePod = p
+					// Check if node is Ready
+					nodeReady := false
+					for _, condition := range node.Status.Conditions {
+						if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+							nodeReady = true
 							break
 						}
 					}
 
-					if alivePod != nil {
-						// Get job name from pod labels
-						jobName := ""
-						if name, ok := alivePod.Labels["job-name"]; ok {
-							jobName = name
-						} else if name, ok := alivePod.Labels["batch.kubernetes.io/job-name"]; ok {
-							jobName = name
-						}
+					if nodeReady {
+						alivePod = p
+						logger.Info("Found alive pod for checkpoint", "pod", p.Name, "node", p.Spec.NodeName, "job", p.Labels["job-name"])
+						break
+					}
+				}
 
-						if jobName != "" {
-							if err := r.createCheckpointForJob(ctx, spotInstanceJob, jobName, true); err != nil {
-								logger.Error(err, "Failed to create checkpoint", "job", jobName)
-							}
-						} else {
-							logger.Info("Could not determine job name from pod labels", "pod", alivePod.Name)
+				if alivePod != nil {
+					// Get job name from pod labels
+					jobName := ""
+					if name, ok := alivePod.Labels["job-name"]; ok {
+						jobName = name
+					} else if name, ok := alivePod.Labels["batch.kubernetes.io/job-name"]; ok {
+						jobName = name
+					}
+
+					if jobName != "" {
+						if err := r.createCheckpointForJob(ctx, spotInstanceJob, jobName, true); err != nil {
+							logger.Error(err, "Failed to create checkpoint", "job", jobName)
 						}
 					} else {
-						logger.Info("No alive pods found for SpotInstanceJob", "spotInstanceJob", spotInstanceJob.Name)
+						logger.Info("Could not determine job name from pod labels", "pod", alivePod.Name)
 					}
 				} else {
-					// No other replicas alive, restore from latest checkpoint
-					logger.Info("No other replicas alive, restoring from latest checkpoint", "jobs", jobs)
-					for _, jobName := range jobs {
-						go r.recreateJobFromLatestCheckpoint(context.Background(), spotInstanceJob, jobName)
+					logger.Info("No alive pods found for SpotInstanceJob (excluding preempted node)", "spotInstanceJob", spotInstanceJob.Name, "preemptedNode", pi.Status.NodeName)
+				}
+			} else {
+				// No other replicas alive, restore from latest checkpoint
+				// Find jobs that were on the preempted node to know which jobs to recreate
+				if pi.Status.NodeName != "" {
+					jobs, err := r.findJobsOnNode(ctx, spotInstanceJob, pi.Status.NodeName)
+					if err != nil {
+						logger.Error(err, "Failed to find jobs on preempted node", "node", pi.Status.NodeName)
+					} else if len(jobs) > 0 {
+						logger.Info("No other replicas alive, restoring from latest checkpoint", "jobs", jobs)
+						for _, jobName := range jobs {
+							go r.recreateJobFromLatestCheckpoint(context.Background(), spotInstanceJob, jobName)
+						}
 					}
 				}
 			}
@@ -728,7 +846,7 @@ func (r *SpotInstanceJobReconciler) waitForCheckpointAndRecreateJob(ctx context.
 	logger.Info("Waiting for checkpoint completion", "job", oldJobName)
 
 	// Wait up to 10 minutes for checkpoint (typically takes 3-5 minutes)
-	timeout := time.After(10 * time.Minute)
+	timeout := time.After(20 * time.Minute)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -764,6 +882,7 @@ func (r *SpotInstanceJobReconciler) waitForCheckpointAndRecreateJob(ctx context.
 				}
 
 				phase, found, _ := unstructured.NestedString(status, "phase")
+				logger.Info("Checking checkpoint", "name", cp.GetName(), "status", status, "phase", phase)
 				if found && (phase == "Completed" || phase == "CompletedPodDeleted") {
 					// Extract containers array from status
 					containers, found, _ := unstructured.NestedSlice(status, "containers")
@@ -986,6 +1105,34 @@ func (r *SpotInstanceJobReconciler) handleDeletion(ctx context.Context, spotInst
 	logger.Info("Handling SpotInstanceJob deletion", "name", spotInstanceJob.Name)
 
 	if controllerutil.ContainsFinalizer(spotInstanceJob, spotInstanceJobFinalizer) {
+		// Delete all CheckpointBackup CRs
+		checkpoints := &unstructured.UnstructuredList{}
+		checkpoints.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "migration.dcnlab.com",
+			Version: "v1",
+			Kind:    "CheckpointBackupList",
+		})
+
+		labelSelector := client.MatchingLabels{
+			spotInstanceJobLabel: spotInstanceJob.Name,
+		}
+		if err := r.List(ctx, checkpoints, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err != nil {
+			logger.Error(err, "Failed to list CheckpointBackup CRs")
+			// Continue with other cleanup even if listing checkpoints fails
+		} else {
+			for _, cp := range checkpoints.Items {
+				if err := r.Delete(ctx, &cp); err != nil {
+					if errors.IsNotFound(err) {
+						logger.Info("CheckpointBackup already deleted", "name", cp.GetName())
+					} else {
+						logger.Error(err, "Failed to delete CheckpointBackup", "name", cp.GetName())
+					}
+				} else {
+					logger.Info("Deleted CheckpointBackup", "name", cp.GetName())
+				}
+			}
+		}
+
 		// Delete all ProvisionedInstances
 		provisionedInstanceList := &trainingv1alpha1.ProvisionedInstanceList{}
 		if err := r.List(ctx, provisionedInstanceList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{

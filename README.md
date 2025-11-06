@@ -56,7 +56,7 @@ kubectl create secret generic gcp-credentials \
 2. **Kubeadm Join Token** (if using dynamic node joining):
 ```bash
 # Generate a token on the control plane
-kubeadm token create --print-join-command
+kubeadm token create --ttl 0 --print-join-command
 
 # Create secret with the token
 kubectl create secret generic kubeadm-join-token \

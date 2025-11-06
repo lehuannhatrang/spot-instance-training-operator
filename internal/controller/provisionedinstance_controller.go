@@ -59,7 +59,6 @@ type ProvisionedInstanceReconciler struct {
 // move the current state of the cluster closer to the desired state.
 func (r *ProvisionedInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	logger.Info("Reconciling ProvisionedInstance", "name", req.Name, "namespace", req.Namespace)
 
 	// Fetch the ProvisionedInstance
 	provisionedInstance := &trainingv1alpha1.ProvisionedInstance{}
@@ -179,7 +178,7 @@ func (r *ProvisionedInstanceReconciler) provisionInstance(ctx context.Context, p
 	joinToken, caCertHash, controlPlaneEndpoint, err := r.fetchKubeadmJoinInfo(ctx, provisionedInstance.Namespace)
 	if err != nil {
 		logger.Error(err, "Failed to fetch kubeadm join info")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, err
 	}
 
 	// Create a copy of the template spec to modify the startup script
@@ -221,7 +220,7 @@ func (r *ProvisionedInstanceReconciler) provisionInstance(ctx context.Context, p
 	}
 
 	// Requeue to check status
-	return ctrl.Result{RequeueAfter: 2 * time.Minute}, nil
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
 // fetchKubeadmJoinInfo fetches kubeadm join information from secret
@@ -274,7 +273,7 @@ func (r *ProvisionedInstanceReconciler) checkAndUpdateInstanceStatus(ctx context
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get instance from GCP")
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	}
 
 	// Instance not found in GCP
@@ -363,7 +362,7 @@ func (r *ProvisionedInstanceReconciler) updateInstanceStatus(ctx context.Context
 	}
 
 	// Requeue to check status again
-	return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 // handleDeletion handles the deletion of a ProvisionedInstance
@@ -424,6 +423,11 @@ func (r *ProvisionedInstanceReconciler) deleteGCPInstance(ctx context.Context, p
 	logger.Info("Deleting GCP instance", "instance", provisionedInstance.Status.InstanceName, "zone", zone)
 
 	if err := provisioner.DeleteInstance(ctx, instanceTemplate.Spec.GCP.Project, zone, provisionedInstance.Status.InstanceName); err != nil {
+		// Check if it's a 404 (instance already deleted)
+		if strings.Contains(err.Error(), "notFound") || strings.Contains(err.Error(), "404") {
+			logger.Info("GCP instance already deleted, continuing with cleanup", "instance", provisionedInstance.Status.InstanceName)
+			return nil
+		}
 		return err
 	}
 
