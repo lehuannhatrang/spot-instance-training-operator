@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,22 +187,59 @@ func (r *SpotInstanceJobReconciler) reconcileJobReplicas(ctx context.Context, sp
 	}
 
 	activeJobs := 0
+	jobsBeingUpdated := make(map[string]bool)
+
+	// Check if there are pending checkpoints - if so, don't create new jobs yet
+	hasPendingCheckpoints, _ := r.hasPendingCheckpoints(ctx, spotInstanceJob)
+	if hasPendingCheckpoints {
+		logger.Info("Pending checkpoints detected, skipping job replica creation")
+		return nil
+	}
+
 	for _, job := range jobList.Items {
+		// Skip jobs that are being deleted (unless very recently deleted, see below)
+		if !job.DeletionTimestamp.IsZero() {
+			deletionAge := time.Since(job.DeletionTimestamp.Time)
+			// If job was deleted very recently (within 5 seconds), it might be being recreated
+			// Don't count it as active but also don't create a new one immediately
+			if deletionAge < 5*time.Second {
+				jobsBeingUpdated[job.Name] = true
+				logger.Info("Job recently deleted, likely being updated", "job", job.Name, "age", deletionAge)
+			}
+			continue
+		}
+
+		// Count jobs that are active or succeeded as active
+		// Jobs with checkpoint-updated annotation are valid and should be counted if they have active pods
 		if job.Status.Active > 0 || job.Status.Succeeded > 0 {
 			activeJobs++
+		} else if job.Annotations != nil {
+			// If job has checkpoint-updated annotation but no active pods yet, it's being set up
+			if _, ok := job.Annotations["training.dcnlab.com/checkpoint-updated"]; ok {
+				jobsBeingUpdated[job.Name] = true
+				logger.Info("Job has checkpoint-updated annotation but no active pods yet", "job", job.Name)
+			}
 		}
 	}
 
 	// Create missing job replicas
+	// Only create new jobs if we're actually missing them (not just temporarily deleted for update)
 	if int32(activeJobs) < desiredReplicas {
 		needed := desiredReplicas - int32(activeJobs)
-		for i := int32(0); i < needed; i++ {
-			jobName := fmt.Sprintf("%s-replica-%d-%d", spotInstanceJob.Name, i, time.Now().Unix())
-			if err := r.createJobReplica(ctx, spotInstanceJob, jobName, i); err != nil {
-				logger.Error(err, "Failed to create job replica", "jobName", jobName)
-				continue
+		// Also account for jobs being updated
+		needed -= int32(len(jobsBeingUpdated))
+
+		if needed > 0 {
+			for i := int32(0); i < needed; i++ {
+				jobName := fmt.Sprintf("%s-replica-%d-%d", spotInstanceJob.Name, i, time.Now().Unix())
+				if err := r.createJobReplica(ctx, spotInstanceJob, jobName, i); err != nil {
+					logger.Error(err, "Failed to create job replica", "jobName", jobName)
+					continue
+				}
+				logger.Info("Created job replica", "jobName", jobName)
 			}
-			logger.Info("Created job replica", "jobName", jobName)
+		} else if len(jobsBeingUpdated) > 0 {
+			logger.Info("Jobs are being updated with checkpoint, waiting before creating new replicas", "jobsBeingUpdated", len(jobsBeingUpdated))
 		}
 	}
 
@@ -422,7 +460,7 @@ func (r *SpotInstanceJobReconciler) hasCompletedCheckpoint(ctx context.Context, 
 	return hasCompleted, completedRecently, nil
 }
 
-// hasRestoredJobs checks if there are any jobs with "restored-from" label, indicating they were recreated from a checkpoint
+// hasRestoredJobs checks if there are any jobs with checkpoint-updated annotation, indicating they were updated with checkpoint images
 func (r *SpotInstanceJobReconciler) hasRestoredJobs(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob) (bool, error) {
 	// List all jobs belonging to this SpotInstanceJob
 	jobList := &batchv1.JobList{}
@@ -432,14 +470,136 @@ func (r *SpotInstanceJobReconciler) hasRestoredJobs(ctx context.Context, spotIns
 		return false, err
 	}
 
-	// Check if any job has "restored-from" label
+	// Check if any job has checkpoint-updated annotation
 	for _, job := range jobList.Items {
-		if _, ok := job.Labels["restored-from"]; ok {
-			return true, nil
+		if job.Annotations != nil {
+			if _, ok := job.Annotations["training.dcnlab.com/checkpoint-updated"]; ok {
+				return true, nil
+			}
 		}
 	}
 
 	return false, nil
+}
+
+// processCompletedCheckpoints processes completed checkpoints by deleting old jobs and recreating them with checkpoint images
+func (r *SpotInstanceJobReconciler) processCompletedCheckpoints(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob) error {
+	logger := log.FromContext(ctx)
+
+	// List all CheckpointBackup CRs for this SpotInstanceJob
+	checkpoints := &unstructured.UnstructuredList{}
+	checkpoints.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "migration.dcnlab.com",
+		Version: "v1",
+		Kind:    "CheckpointBackupList",
+	})
+
+	labelSelector := client.MatchingLabels{
+		spotInstanceJobLabel: spotInstanceJob.Name,
+	}
+	if err := r.List(ctx, checkpoints, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err != nil {
+		return err
+	}
+
+	// Track which jobs have been processed
+	processedJobs := make(map[string]bool)
+
+	// Process each completed checkpoint
+	for _, cp := range checkpoints.Items {
+		status, found, _ := unstructured.NestedMap(cp.Object, "status")
+		if !found {
+			continue
+		}
+
+		phase, found, _ := unstructured.NestedString(status, "phase")
+		if !found || (phase != "Completed" && phase != "CompletedPodDeleted") {
+			continue
+		}
+
+		// Get job name from checkpoint labels
+		jobName, found := cp.GetLabels()["training.dcnlab.com/job"]
+		if !found {
+			continue
+		}
+
+		// Skip if already processed
+		if processedJobs[jobName] {
+			continue
+		}
+
+		// Check if job still exists
+		job := &batchv1.Job{}
+		if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: spotInstanceJob.Namespace}, job); err != nil {
+			if errors.IsNotFound(err) {
+				// Job doesn't exist, might be being recreated - skip for now
+				continue
+			}
+			return err
+		}
+
+		// Check if job has already been updated with checkpoint
+		if job.Annotations != nil {
+			if _, ok := job.Annotations["training.dcnlab.com/checkpoint-updated"]; ok {
+				// Job was already updated, skip
+				processedJobs[jobName] = true
+				continue
+			}
+		}
+
+		// Check if job is being deleted
+		if !job.DeletionTimestamp.IsZero() {
+			// Job is being deleted, skip
+			continue
+		}
+
+		// Extract containers from checkpoint status
+		// Try status.containers first, then fall back to status.builtImages
+		var checkpointContainers []map[string]interface{}
+		containers, found, _ := unstructured.NestedSlice(status, "containers")
+		if found && len(containers) > 0 {
+			checkpointContainers = make([]map[string]interface{}, len(containers))
+			for i, c := range containers {
+				if containerMap, ok := c.(map[string]interface{}); ok {
+					checkpointContainers[i] = containerMap
+				}
+			}
+		} else {
+			// Fall back to builtImages
+			builtImages, found, _ := unstructured.NestedSlice(status, "builtImages")
+			if found && len(builtImages) > 0 {
+				checkpointContainers = make([]map[string]interface{}, len(builtImages))
+				for i, img := range builtImages {
+					if imgMap, ok := img.(map[string]interface{}); ok {
+						// Convert builtImages format to containers format
+						containerName, _ := imgMap["containerName"].(string)
+						imageName, _ := imgMap["imageName"].(string)
+						checkpointContainers[i] = map[string]interface{}{
+							"name":  containerName,
+							"image": imageName,
+						}
+					}
+				}
+			}
+		}
+
+		if len(checkpointContainers) == 0 {
+			logger.Info("No containers found in completed checkpoint, skipping", "checkpoint", cp.GetName(), "job", jobName)
+			continue
+		}
+
+		logger.Info("Processing completed checkpoint, updating job with checkpoint images", "checkpoint", cp.GetName(), "job", jobName)
+
+		// Update job with checkpoint images (updates container images instead of deleting/recreating)
+		if err := r.updateJobWithCheckpoint(ctx, spotInstanceJob, jobName, checkpointContainers); err != nil {
+			logger.Error(err, "Failed to update job with checkpoint", "job", jobName)
+			continue
+		}
+
+		processedJobs[jobName] = true
+		logger.Info("Successfully processed completed checkpoint", "checkpoint", cp.GetName(), "job", jobName)
+	}
+
+	return nil
 }
 
 // handlePreemption checks for preempted instances and handles them appropriately
@@ -472,7 +632,13 @@ func (r *SpotInstanceJobReconciler) handlePreemption(ctx context.Context, spotIn
 			}
 
 			if activeReplicas > 0 {
-				// Other replicas alive, check if we've already handled this preemption
+				// Other replicas alive, first check if there are completed checkpoints that need to be processed
+				// Process completed checkpoints synchronously before creating new ones
+				if err := r.processCompletedCheckpoints(ctx, spotInstanceJob); err != nil {
+					logger.Error(err, "Failed to process completed checkpoints")
+				}
+
+				// Check if we've already handled this preemption
 				// Check if there's already a completed checkpoint for this SpotInstanceJob
 				hasCompletedCheckpoint, completedRecently, err := r.hasCompletedCheckpoint(ctx, spotInstanceJob)
 				if err != nil {
@@ -657,7 +823,10 @@ func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, 
 		"training.dcnlab.com/job": jobName,
 	}
 	if err := r.List(ctx, checkpoints, client.InNamespace(spotInstanceJob.Namespace), labelSelector); err == nil {
-		// Check if there's already an in-progress checkpoint
+		hasInProgressCheckpoint := false
+		hasCompletedCheckpoint := false
+
+		// Check all checkpoints for this job
 		for _, cp := range checkpoints.Items {
 			status, found, _ := unstructured.NestedMap(cp.Object, "status")
 			if found {
@@ -667,18 +836,63 @@ func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, 
 					// Terminal states: PhaseCompleted, PhaseCompletedPodDeleted, PhaseCompletedWithError, PhaseFailed
 					// In-progress states: PhaseCheckpointing, PhaseCheckpointed, PhaseImageBuilding, PhaseImageBuilt, PhaseImagePushing, PhaseImagePushed
 					if phase != "Completed" && phase != "CompletedPodDeleted" && phase != "CompletedWithError" && phase != "Failed" {
+						hasInProgressCheckpoint = true
 						logger.Info("CheckpointBackup already exists for job and is in progress", "job", jobName, "checkpoint", cp.GetName(), "phase", phase)
-						return nil
+					} else if phase == "Completed" || phase == "CompletedPodDeleted" {
+						hasCompletedCheckpoint = true
 					}
 				} else {
 					// Phase not set yet, assume it's pending/in-progress
+					hasInProgressCheckpoint = true
 					logger.Info("CheckpointBackup already exists for job (phase not set yet)", "job", jobName, "checkpoint", cp.GetName())
-					return nil
 				}
 			} else {
 				// Status not set yet, assume it's pending/in-progress
+				hasInProgressCheckpoint = true
 				logger.Info("CheckpointBackup already exists for job (no status yet)", "job", jobName, "checkpoint", cp.GetName())
-				return nil
+			}
+		}
+
+		// If there's an in-progress checkpoint, don't create a new one
+		if hasInProgressCheckpoint {
+			return nil
+		}
+
+		// If there's a completed checkpoint, check if the job is being recreated
+		if hasCompletedCheckpoint {
+			// Check if the job still exists (hasn't been deleted/recreated yet)
+			job := &batchv1.Job{}
+			if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: spotInstanceJob.Namespace}, job); err == nil {
+				// Job still exists, check if it's being deleted or has been recreated
+				if !job.DeletionTimestamp.IsZero() {
+					// Job is being deleted, don't create a new checkpoint
+					logger.Info("Job is being deleted, skipping checkpoint creation", "job", jobName)
+					return nil
+				}
+
+				// Check if job has "restored-from" label (already recreated)
+				if _, ok := job.Labels["restored-from"]; ok {
+					// Job was already recreated, it's safe to create a new checkpoint if needed
+					logger.Info("Job was already recreated, allowing new checkpoint", "job", jobName)
+				} else {
+					// Job exists and hasn't been recreated yet, wait for recreation to complete
+					logger.Info("Completed checkpoint exists and job hasn't been recreated yet, skipping new checkpoint", "job", jobName)
+					return nil
+				}
+			} else if errors.IsNotFound(err) {
+				// Job doesn't exist, it might have been deleted and is being recreated
+				// Check if there's a restored job
+				restoredJobList := &batchv1.JobList{}
+				if err := r.List(ctx, restoredJobList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
+					"restored-from": jobName,
+				}); err == nil && len(restoredJobList.Items) > 0 {
+					// Job was recreated, it's safe to create a new checkpoint if needed
+					logger.Info("Job was recreated, allowing new checkpoint", "job", jobName, "restoredJob", restoredJobList.Items[0].Name)
+				} else {
+					// Job doesn't exist and hasn't been recreated yet, wait
+					logger.Info("Completed checkpoint exists but job doesn't exist yet (recreation in progress), skipping new checkpoint", "job", jobName)
+					return nil
+				}
 			}
 		}
 	}
@@ -885,6 +1099,7 @@ func (r *SpotInstanceJobReconciler) waitForCheckpointAndRecreateJob(ctx context.
 				logger.Info("Checking checkpoint", "name", cp.GetName(), "status", status, "phase", phase)
 				if found && (phase == "Completed" || phase == "CompletedPodDeleted") {
 					// Extract containers array from status
+					// Try status.containers first, then fall back to status.builtImages
 					containers, found, _ := unstructured.NestedSlice(status, "containers")
 					if found && len(containers) > 0 {
 						foundContainers = make([]map[string]interface{}, len(containers))
@@ -894,6 +1109,24 @@ func (r *SpotInstanceJobReconciler) waitForCheckpointAndRecreateJob(ctx context.
 							}
 						}
 						break
+					} else {
+						// Fall back to builtImages
+						builtImages, found, _ := unstructured.NestedSlice(status, "builtImages")
+						if found && len(builtImages) > 0 {
+							foundContainers = make([]map[string]interface{}, len(builtImages))
+							for i, img := range builtImages {
+								if imgMap, ok := img.(map[string]interface{}); ok {
+									// Convert builtImages format to containers format
+									containerName, _ := imgMap["containerName"].(string)
+									imageName, _ := imgMap["imageName"].(string)
+									foundContainers[i] = map[string]interface{}{
+										"name":  containerName,
+										"image": imageName,
+									}
+								}
+							}
+							break
+						}
 					}
 				}
 			}
@@ -902,15 +1135,38 @@ func (r *SpotInstanceJobReconciler) waitForCheckpointAndRecreateJob(ctx context.
 				checkpointContainers = foundContainers
 				logger.Info("Checkpoint completed", "job", oldJobName, "containers", len(checkpointContainers))
 
-				// Delete old job
-				if err := r.deleteJob(ctx, spotInstanceJob.Namespace, oldJobName); err != nil {
-					logger.Error(err, "Failed to delete old job", "job", oldJobName)
+				// Check if job still exists
+				job := &batchv1.Job{}
+				if err := r.Get(ctx, types.NamespacedName{Name: oldJobName, Namespace: spotInstanceJob.Namespace}, job); err != nil {
+					if errors.IsNotFound(err) {
+						logger.Info("Job doesn't exist, may have been deleted or updated", "job", oldJobName)
+						return
+					}
+					logger.Error(err, "Failed to get job", "job", oldJobName)
+					continue
 				}
 
-				// Recreate job with checkpoint images
-				if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, checkpointContainers); err != nil {
-					logger.Error(err, "Failed to recreate job", "job", oldJobName)
+				// Check if job has already been updated with checkpoint
+				if job.Annotations != nil {
+					if _, ok := job.Annotations["training.dcnlab.com/checkpoint-updated"]; ok {
+						logger.Info("Job was already updated with checkpoint", "job", oldJobName)
+						return
+					}
 				}
+
+				// Check if job is being deleted
+				if !job.DeletionTimestamp.IsZero() {
+					logger.Info("Job is being deleted, waiting for deletion to complete", "job", oldJobName)
+					continue
+				}
+
+				// Update job with checkpoint images (updates container images instead of deleting/recreating)
+				if err := r.updateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, checkpointContainers); err != nil {
+					logger.Error(err, "Failed to update job with checkpoint", "job", oldJobName)
+					continue
+				}
+
+				logger.Info("Successfully updated job with checkpoint images", "job", oldJobName)
 				return
 			}
 		}
@@ -964,39 +1220,64 @@ func (r *SpotInstanceJobReconciler) recreateJobFromLatestCheckpoint(ctx context.
 		}
 
 		// Extract containers array from status
-		containers, found, _ := unstructured.NestedSlice(status, "containers")
-		if found && len(containers) > 0 {
-			if latestContainers == nil || completionTime.After(latestTime) {
-				latestContainers = make([]map[string]interface{}, len(containers))
-				for i, c := range containers {
-					if containerMap, ok := c.(map[string]interface{}); ok {
-						latestContainers[i] = containerMap
+		// Try status.containers first, then fall back to status.builtImages
+		var containers []map[string]interface{}
+		containersSlice, found, _ := unstructured.NestedSlice(status, "containers")
+		if found && len(containersSlice) > 0 {
+			containers = make([]map[string]interface{}, len(containersSlice))
+			for i, c := range containersSlice {
+				if containerMap, ok := c.(map[string]interface{}); ok {
+					containers[i] = containerMap
+				}
+			}
+		} else {
+			// Fall back to builtImages
+			builtImages, found, _ := unstructured.NestedSlice(status, "builtImages")
+			if found && len(builtImages) > 0 {
+				containers = make([]map[string]interface{}, len(builtImages))
+				for i, img := range builtImages {
+					if imgMap, ok := img.(map[string]interface{}); ok {
+						// Convert builtImages format to containers format
+						containerName, _ := imgMap["containerName"].(string)
+						imageName, _ := imgMap["imageName"].(string)
+						containers[i] = map[string]interface{}{
+							"name":  containerName,
+							"image": imageName,
+						}
 					}
 				}
+			}
+		}
+
+		if len(containers) > 0 {
+			if latestContainers == nil || completionTime.After(latestTime) {
+				latestContainers = containers
 				latestTime = completionTime
 			}
 		}
 	}
 
 	if len(latestContainers) == 0 {
-		logger.Info("No completed checkpoint found, recreating without checkpoint", "job", oldJobName)
-		// Recreate without checkpoint
-		if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, nil); err != nil {
-			logger.Error(err, "Failed to recreate job", "job", oldJobName)
-		}
+		logger.Info("No completed checkpoint found, cannot update job", "job", oldJobName)
 		return
 	}
 
 	logger.Info("Found latest checkpoint", "job", oldJobName, "containers", len(latestContainers))
 
-	// Delete old job
-	if err := r.deleteJob(ctx, spotInstanceJob.Namespace, oldJobName); err != nil {
-		logger.Error(err, "Failed to delete old job", "job", oldJobName)
+	// Check if job exists
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: oldJobName, Namespace: spotInstanceJob.Namespace}, job); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Job doesn't exist, cannot update", "job", oldJobName)
+			return
+		}
+		logger.Error(err, "Failed to get job", "job", oldJobName)
+		return
 	}
 
-	// Recreate job with checkpoint
-	if err := r.recreateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, latestContainers); err != nil {
-		logger.Error(err, "Failed to recreate job", "job", oldJobName)
+	// Update job with checkpoint images (updates container images instead of deleting/recreating)
+	if err := r.updateJobWithCheckpoint(ctx, spotInstanceJob, oldJobName, latestContainers); err != nil {
+		logger.Error(err, "Failed to update job with checkpoint", "job", oldJobName)
 	}
 }
 
@@ -1011,6 +1292,153 @@ func (r *SpotInstanceJobReconciler) deleteJob(ctx context.Context, namespace, jo
 	}
 
 	return r.Delete(ctx, job)
+}
+
+// updateJobWithCheckpoint updates an existing job's container images with checkpoint images
+// This is done by deleting all pods, then deleting and immediately recreating the job with updated images
+func (r *SpotInstanceJobReconciler) updateJobWithCheckpoint(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, jobName string, checkpointContainers []map[string]interface{}) error {
+	logger := log.FromContext(ctx)
+
+	// Get the existing job
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: spotInstanceJob.Namespace}, job); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Job not found, cannot update", "job", jobName)
+			return nil
+		}
+		return err
+	}
+
+	// Check if job has already been updated with checkpoint (has annotation)
+	if job.Annotations != nil {
+		if _, ok := job.Annotations["training.dcnlab.com/checkpoint-updated"]; ok {
+			logger.Info("Job already updated with checkpoint, skipping", "job", jobName)
+			return nil
+		}
+	}
+
+	// Create a map of container name -> checkpoint image
+	checkpointImageMap := make(map[string]string)
+	if len(checkpointContainers) > 0 {
+		for _, c := range checkpointContainers {
+			if name, ok := c["name"].(string); ok {
+				if image, ok := c["image"].(string); ok {
+					checkpointImageMap[name] = image
+				}
+			}
+		}
+	}
+
+	// Save the job spec and update container images
+	updatedJobSpec := job.Spec.DeepCopy()
+
+	// Update container images
+	if len(checkpointImageMap) > 0 {
+		for i := range updatedJobSpec.Template.Spec.Containers {
+			containerName := updatedJobSpec.Template.Spec.Containers[i].Name
+			if checkpointImage, found := checkpointImageMap[containerName]; found {
+				updatedJobSpec.Template.Spec.Containers[i].Image = checkpointImage
+				logger.Info("Updating container with checkpoint image", "container", containerName, "image", checkpointImage)
+			}
+		}
+	}
+
+	// Extract replica index from job labels if available
+	replicaIndex := int32(0)
+	if replicaIndexStr, ok := job.Labels[jobReplicaLabel]; ok {
+		if idx, err := strconv.ParseInt(replicaIndexStr, 10, 32); err == nil {
+			replicaIndex = int32(idx)
+		}
+	}
+
+	// Delete the job with background propagation to also delete pods
+	// Use DeleteOptions to set propagation policy
+	propagationPolicy := metav1.DeletePropagationBackground
+	deleteOptions := client.DeleteOptions{
+		PropagationPolicy: &propagationPolicy,
+	}
+	if err := r.Delete(ctx, job, &deleteOptions); err != nil {
+		return fmt.Errorf("failed to delete job: %w", err)
+	}
+
+	// Wait for the deletion to be processed (Kubernetes needs time to delete the job and its pods)
+	time.Sleep(2 * time.Second)
+
+	// Create the job again with updated spec
+	// Clear immutable fields: spec.selector and auto-generated labels
+	newJobName := jobName // Try to use the same name
+	newJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      newJobName,
+			Namespace: spotInstanceJob.Namespace,
+			Labels: map[string]string{
+				spotInstanceJobLabel: spotInstanceJob.Name,
+				jobReplicaLabel:      fmt.Sprintf("%d", replicaIndex),
+			},
+			Annotations: map[string]string{
+				"training.dcnlab.com/checkpoint-updated": "true",
+			},
+		},
+		Spec: batchv1.JobSpec{
+			// Copy all fields from updatedJobSpec except selector
+			Parallelism:             updatedJobSpec.Parallelism,
+			Completions:             updatedJobSpec.Completions,
+			ActiveDeadlineSeconds:   updatedJobSpec.ActiveDeadlineSeconds,
+			BackoffLimit:            updatedJobSpec.BackoffLimit,
+			TTLSecondsAfterFinished: updatedJobSpec.TTLSecondsAfterFinished,
+			CompletionMode:          updatedJobSpec.CompletionMode,
+			Suspend:                 updatedJobSpec.Suspend,
+			PodFailurePolicy:        updatedJobSpec.PodFailurePolicy,
+			// Don't copy selector - Kubernetes will auto-generate it
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: make(map[string]string),
+				},
+				Spec: updatedJobSpec.Template.Spec,
+			},
+		},
+	}
+
+	// Set only our custom labels (clear auto-generated labels)
+	newJob.Spec.Template.Labels[spotInstanceJobLabel] = spotInstanceJob.Name
+	newJob.Spec.Template.Labels[jobReplicaLabel] = fmt.Sprintf("%d", replicaIndex)
+
+	// Set owner reference
+	if err := controllerutil.SetControllerReference(spotInstanceJob, newJob, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	// Try to create the job with the same name
+	if err := r.Create(ctx, newJob); err != nil {
+		if errors.IsAlreadyExists(err) {
+			// Job with same name already exists (maybe recreated by SpotInstanceJob controller)
+			// Check if it already has checkpoint images
+			existingJob := &batchv1.Job{}
+			if err := r.Get(ctx, types.NamespacedName{Name: newJobName, Namespace: spotInstanceJob.Namespace}, existingJob); err == nil {
+				hasCheckpointImages := true
+				for i := range existingJob.Spec.Template.Spec.Containers {
+					containerName := existingJob.Spec.Template.Spec.Containers[i].Name
+					if checkpointImage, found := checkpointImageMap[containerName]; found {
+						if existingJob.Spec.Template.Spec.Containers[i].Image != checkpointImage {
+							hasCheckpointImages = false
+							break
+						}
+					}
+				}
+				if hasCheckpointImages {
+					logger.Info("Job already has checkpoint images", "job", newJobName)
+					return nil
+				}
+			}
+			// Job exists but doesn't have checkpoint images - this shouldn't happen but handle it
+			logger.Info("Job with same name exists but doesn't have checkpoint images, will be handled by next reconciliation", "job", newJobName)
+			return nil
+		}
+		return fmt.Errorf("failed to create updated job: %w", err)
+	}
+
+	logger.Info("Successfully updated job with checkpoint images", "job", jobName, "containers", len(checkpointImageMap))
+	return nil
 }
 
 // recreateJobWithCheckpoint recreates a job with optional checkpoint container images
