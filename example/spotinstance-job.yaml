@@ -19,6 +19,9 @@ spec:
   jobTemplate:
     spec:
       template:
+        metadata:
+          annotations:
+            container.devices.cdi.k8s.io/trainer: "nvidia.com/gpu=0"
         spec:
           runtimeClassName: nvidia-cdi
           restartPolicy: Never
