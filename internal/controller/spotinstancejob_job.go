@@ -367,6 +367,10 @@ func (r *SpotInstanceJobReconciler) updateJobWithCheckpoint(ctx context.Context,
 	// Save the job spec and update container images
 	updatedJobSpec := job.Spec.DeepCopy()
 
+	// Clear the old nodeName - we'll assign to a new node
+	updatedJobSpec.Template.Spec.NodeName = ""
+	logger.Info("Cleared old nodeName from job spec", "job", jobName, "oldNodeName", job.Spec.Template.Spec.NodeName)
+
 	// Update container images
 	if len(checkpointImageMap) > 0 {
 		for i := range updatedJobSpec.Template.Spec.Containers {
@@ -476,10 +480,14 @@ func (r *SpotInstanceJobReconciler) updateJobWithCheckpoint(ctx context.Context,
 			newJob.Spec.Template.Spec.NodeName = activePI.Status.NodeName
 			logger.Info("Assigning updated job to node", "job", jobName, "replicaIndex", replicaIndex, "node", activePI.Status.NodeName, "instance", activePI.Name)
 		} else {
-			logger.Info("No active ProvisionedInstance ready yet for updated job, pod will be scheduled normally", "replicaIndex", replicaIndex)
+			// No active ProvisionedInstance ready yet - wait for it to be provisioned
+			logger.Info("No active ProvisionedInstance ready yet for updated job, will retry later", "replicaIndex", replicaIndex)
+			return fmt.Errorf("waiting for ProvisionedInstance with replica index %d to be ready", replicaIndex)
 		}
 	} else {
-		logger.Info("No ProvisionedInstance found for replica index for updated job, pod will be scheduled normally", "replicaIndex", replicaIndex)
+		// No ProvisionedInstance found - wait for it to be created
+		logger.Info("No ProvisionedInstance found for replica index for updated job, will retry later", "replicaIndex", replicaIndex)
+		return fmt.Errorf("waiting for ProvisionedInstance with replica index %d to be created", replicaIndex)
 	}
 
 	// Set owner reference
