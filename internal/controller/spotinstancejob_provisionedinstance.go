@@ -86,9 +86,14 @@ func (r *SpotInstanceJobReconciler) reconcileProvisionedInstances(ctx context.Co
 		}
 	}
 
-	// Track which replica indices already have ProvisionedInstances
+	// Track which replica indices already have ACTIVE ProvisionedInstances
+	// Don't count terminated/preempted instances so their replica index can be reused
 	replicaIndicesWithInstances := make(map[int32]bool)
 	for _, pi := range provisionedInstanceList.Items {
+		// Skip terminated/preempted instances - their replica index should be reused
+		if pi.Status.PreemptionNotice || pi.Status.State == "TERMINATED" || pi.Status.State == "STOPPING" {
+			continue
+		}
 		// Extract replica index from labels if available
 		if replicaIndexStr, ok := pi.Labels[jobReplicaLabel]; ok {
 			if idx, err := strconv.ParseInt(replicaIndexStr, 10, 32); err == nil {

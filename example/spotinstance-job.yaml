@@ -35,9 +35,7 @@ spec:
                 pip install transformers==4.18.0;
                 export PYTHONPATH=/home/deepspeed/.local/lib/python3.6/site-packages:$PYTHONPATH;
                 deepspeed --num_gpus=1 /workspace/train.py
-            resources:
-              limits:
-                nvidia.com/gpu: 1
+            resources: {}
             env:
               - name: OMP_NUM_THREADS
                 value: "1"

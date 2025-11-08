@@ -97,12 +97,6 @@ func (r *SpotInstanceJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 
-	// Reconcile Job replicas
-	if err := r.reconcileJobReplicas(ctx, spotInstanceJob); err != nil {
-		logger.Error(err, "Failed to reconcile job replicas")
-		return ctrl.Result{}, err
-	}
-
 	// Handle preemption FIRST (this will create checkpoints if preemption is detected)
 	pendingCheckpoints, err := r.hasPendingCheckpoints(ctx, spotInstanceJob)
 	if err != nil {
@@ -132,6 +126,13 @@ func (r *SpotInstanceJobReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			logger.Error(reconcileErr, "Failed to reconcile provisioned instances")
 			return ctrl.Result{}, reconcileErr
 		}
+	}
+
+	// Reconcile Job replicas AFTER ProvisionedInstances are created
+	// This allows jobs to be assigned to specific nodes
+	if err := r.reconcileJobReplicas(ctx, spotInstanceJob); err != nil {
+		logger.Error(err, "Failed to reconcile job replicas")
+		return ctrl.Result{}, err
 	}
 
 	// Update status

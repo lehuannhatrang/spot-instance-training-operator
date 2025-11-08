@@ -116,7 +116,8 @@ func (r *SpotInstanceJobReconciler) reconcileJobReplicas(ctx context.Context, sp
 
 		replicaIndex := int32(0)
 		created := int32(0)
-		for created < needed {
+		skipped := int32(0) // Track how many times we skipped without creating
+		for created < needed && replicaIndex < desiredReplicas*2 {
 			// Find next replica index without a job
 			for replicaIndicesWithJobs[replicaIndex] {
 				replicaIndex++
@@ -124,6 +125,12 @@ func (r *SpotInstanceJobReconciler) reconcileJobReplicas(ctx context.Context, sp
 					logger.Info("Too many replica indices checked, stopping", "replicaIndex", replicaIndex)
 					break
 				}
+			}
+
+			// Safety check: if replicaIndex is too high, break out
+			if replicaIndex >= desiredReplicas*2 {
+				logger.Info("Reached maximum replica index limit, stopping job creation", "replicaIndex", replicaIndex, "limit", desiredReplicas*2)
+				break
 			}
 
 			// Double-check that no job with this replica index exists
@@ -164,6 +171,62 @@ func (r *SpotInstanceJobReconciler) reconcileJobReplicas(ctx context.Context, sp
 				}
 			}
 
+			// Check if ProvisionedInstance exists and is ready for this replica index
+			provisionedInstanceList := &trainingv1alpha1.ProvisionedInstanceList{}
+			if err := r.List(ctx, provisionedInstanceList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
+				spotInstanceJobLabel: spotInstanceJob.Name,
+				jobReplicaLabel:      fmt.Sprintf("%d", replicaIndex),
+			}); err == nil && len(provisionedInstanceList.Items) > 0 {
+				// Find an ACTIVE ProvisionedInstance (skip terminated ones)
+				var activePI *trainingv1alpha1.ProvisionedInstance
+				for i := range provisionedInstanceList.Items {
+					pi := &provisionedInstanceList.Items[i]
+					// Skip terminated/preempted instances
+					if pi.Status.PreemptionNotice || pi.Status.State == "TERMINATED" || pi.Status.State == "STOPPING" {
+						continue
+					}
+					activePI = pi
+					break
+				}
+
+				if activePI != nil {
+					if !activePI.Status.JoinedCluster || activePI.Status.NodeName == "" {
+						// ProvisionedInstance exists but hasn't joined the cluster yet, wait
+						logger.Info("Waiting for ProvisionedInstance to join cluster before creating job", "instance", activePI.Name, "replicaIndex", replicaIndex, "state", activePI.Status.State, "joinedCluster", activePI.Status.JoinedCluster)
+						replicaIndex++
+						skipped++
+						// If we've skipped too many times, break to avoid infinite loop
+						if skipped >= desiredReplicas*2 {
+							logger.Info("Too many skips without creating jobs, will retry on next reconciliation", "skipped", skipped)
+							break
+						}
+						continue
+					}
+					// Active ProvisionedInstance is ready, proceed to create job
+				} else {
+					// Only terminated instances found, treat as if no instance exists
+					logger.Info("Only terminated ProvisionedInstances found for replica index, waiting for new one", "replicaIndex", replicaIndex)
+					replicaIndex++
+					skipped++
+					if skipped >= desiredReplicas*2 {
+						logger.Info("Too many skips without creating jobs, will retry on next reconciliation", "skipped", skipped)
+						break
+					}
+					continue
+				}
+			} else if err == nil && len(provisionedInstanceList.Items) == 0 {
+				// No ProvisionedInstance for this replica index yet, wait for it to be created
+				logger.Info("No ProvisionedInstance found for replica index, waiting", "replicaIndex", replicaIndex)
+				replicaIndex++
+				skipped++
+				// If we've skipped too many times, break to avoid infinite loop
+				if skipped >= desiredReplicas*2 {
+					logger.Info("Too many skips without creating jobs, will retry on next reconciliation", "skipped", skipped)
+					break
+				}
+				continue
+			}
+
 			jobName := fmt.Sprintf("%s-replica-%d-%d", spotInstanceJob.Name, replicaIndex, time.Now().Unix())
 			if err := r.createJobReplica(ctx, spotInstanceJob, jobName, replicaIndex); err != nil {
 				logger.Error(err, "Failed to create job replica", "jobName", jobName, "replicaIndex", replicaIndex)
@@ -174,6 +237,7 @@ func (r *SpotInstanceJobReconciler) reconcileJobReplicas(ctx context.Context, sp
 			replicaIndicesWithJobs[replicaIndex] = true
 			replicaIndex++
 			created++
+			skipped = 0 // Reset skipped counter after successful creation
 		}
 	} else if len(jobsBeingUpdated) > 0 {
 		logger.Info("All replica indices have jobs, some are being updated", "activeReplicaCount", activeReplicaCount, "jobsBeingUpdated", len(jobsBeingUpdated))
@@ -185,6 +249,8 @@ func (r *SpotInstanceJobReconciler) reconcileJobReplicas(ctx context.Context, sp
 // createJobReplica creates a new job replica
 
 func (r *SpotInstanceJobReconciler) createJobReplica(ctx context.Context, spotInstanceJob *trainingv1alpha1.SpotInstanceJob, jobName string, replicaIndex int32) error {
+	logger := log.FromContext(ctx)
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -203,6 +269,42 @@ func (r *SpotInstanceJobReconciler) createJobReplica(ctx context.Context, spotIn
 	}
 	job.Spec.Template.Labels[spotInstanceJobLabel] = spotInstanceJob.Name
 	job.Spec.Template.Labels[jobReplicaLabel] = fmt.Sprintf("%d", replicaIndex)
+
+	// Find the ProvisionedInstance with the same replica index and assign pod to its node
+	provisionedInstanceList := &trainingv1alpha1.ProvisionedInstanceList{}
+	if err := r.List(ctx, provisionedInstanceList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
+		spotInstanceJobLabel: spotInstanceJob.Name,
+		jobReplicaLabel:      fmt.Sprintf("%d", replicaIndex),
+	}); err != nil {
+		logger.Error(err, "Failed to list ProvisionedInstances for replica index", "replicaIndex", replicaIndex)
+	} else if len(provisionedInstanceList.Items) > 0 {
+		// Find the ACTIVE (non-preempted, RUNNING) ProvisionedInstance
+		var activePI *trainingv1alpha1.ProvisionedInstance
+		for i := range provisionedInstanceList.Items {
+			pi := &provisionedInstanceList.Items[i]
+			// Skip preempted/terminated instances
+			if pi.Status.PreemptionNotice || pi.Status.State == "TERMINATED" || pi.Status.State == "STOPPING" {
+				logger.Info("Skipping preempted/terminated ProvisionedInstance", "instance", pi.Name, "state", pi.Status.State, "preemptionNotice", pi.Status.PreemptionNotice)
+				continue
+			}
+			// Only use instances that are RUNNING and have joined the cluster
+			if pi.Status.State == "RUNNING" && pi.Status.JoinedCluster && pi.Status.NodeName != "" {
+				activePI = pi
+				logger.Info("Found active ProvisionedInstance for job replica", "instance", pi.Name, "node", pi.Status.NodeName, "replicaIndex", replicaIndex)
+				break
+			}
+		}
+
+		if activePI != nil {
+			// Assign pod to this node
+			job.Spec.Template.Spec.NodeName = activePI.Status.NodeName
+			logger.Info("Assigning job replica to node", "job", jobName, "replicaIndex", replicaIndex, "node", activePI.Status.NodeName, "instance", activePI.Name)
+		} else {
+			logger.Info("No active ProvisionedInstance ready yet, pod will be scheduled normally", "replicaIndex", replicaIndex)
+		}
+	} else {
+		logger.Info("No ProvisionedInstance found for replica index, pod will be scheduled normally", "replicaIndex", replicaIndex)
+	}
 
 	// Set owner reference
 	if err := controllerutil.SetControllerReference(spotInstanceJob, job, r.Scheme); err != nil {
@@ -325,16 +427,60 @@ func (r *SpotInstanceJobReconciler) updateJobWithCheckpoint(ctx context.Context,
 			// Don't copy selector - Kubernetes will auto-generate it
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: make(map[string]string),
+					Labels:      make(map[string]string),
+					Annotations: make(map[string]string),
 				},
 				Spec: updatedJobSpec.Template.Spec,
 			},
 		},
 	}
 
+	// Preserve original pod template annotations from the job
+	if job.Spec.Template.Annotations != nil {
+		for k, v := range job.Spec.Template.Annotations {
+			newJob.Spec.Template.Annotations[k] = v
+		}
+	}
+
 	// Set only our custom labels (clear auto-generated labels)
 	newJob.Spec.Template.Labels[spotInstanceJobLabel] = spotInstanceJob.Name
 	newJob.Spec.Template.Labels[jobReplicaLabel] = fmt.Sprintf("%d", replicaIndex)
+
+	// Find the ProvisionedInstance with the same replica index and assign pod to its node
+	provisionedInstanceList := &trainingv1alpha1.ProvisionedInstanceList{}
+	if err := r.List(ctx, provisionedInstanceList, client.InNamespace(spotInstanceJob.Namespace), client.MatchingLabels{
+		spotInstanceJobLabel: spotInstanceJob.Name,
+		jobReplicaLabel:      fmt.Sprintf("%d", replicaIndex),
+	}); err != nil {
+		logger.Error(err, "Failed to list ProvisionedInstances for replica index", "replicaIndex", replicaIndex)
+	} else if len(provisionedInstanceList.Items) > 0 {
+		// Find the ACTIVE (non-preempted, RUNNING) ProvisionedInstance
+		var activePI *trainingv1alpha1.ProvisionedInstance
+		for i := range provisionedInstanceList.Items {
+			pi := &provisionedInstanceList.Items[i]
+			// Skip preempted/terminated instances
+			if pi.Status.PreemptionNotice || pi.Status.State == "TERMINATED" || pi.Status.State == "STOPPING" {
+				logger.Info("Skipping preempted/terminated ProvisionedInstance", "instance", pi.Name, "state", pi.Status.State, "preemptionNotice", pi.Status.PreemptionNotice)
+				continue
+			}
+			// Only use instances that are RUNNING and have joined the cluster
+			if pi.Status.State == "RUNNING" && pi.Status.JoinedCluster && pi.Status.NodeName != "" {
+				activePI = pi
+				logger.Info("Found active ProvisionedInstance for updated job", "instance", pi.Name, "node", pi.Status.NodeName, "replicaIndex", replicaIndex)
+				break
+			}
+		}
+
+		if activePI != nil {
+			// Assign pod to this node
+			newJob.Spec.Template.Spec.NodeName = activePI.Status.NodeName
+			logger.Info("Assigning updated job to node", "job", jobName, "replicaIndex", replicaIndex, "node", activePI.Status.NodeName, "instance", activePI.Name)
+		} else {
+			logger.Info("No active ProvisionedInstance ready yet for updated job, pod will be scheduled normally", "replicaIndex", replicaIndex)
+		}
+	} else {
+		logger.Info("No ProvisionedInstance found for replica index for updated job, pod will be scheduled normally", "replicaIndex", replicaIndex)
+	}
 
 	// Set owner reference
 	if err := controllerutil.SetControllerReference(spotInstanceJob, newJob, r.Scheme); err != nil {
