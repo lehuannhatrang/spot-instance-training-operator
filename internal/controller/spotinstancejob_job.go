@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -352,13 +353,25 @@ func (r *SpotInstanceJobReconciler) updateJobWithCheckpoint(ctx context.Context,
 		}
 	}
 
+	registryURL := "docker.io"
+	// Parse registry URL if provided (e.g., "docker.io/lehuannhatrang/gpu-checkpoints" or "gcr.io/project/repo")
+	if strings.Contains(spotInstanceJob.Spec.CheckpointConfig.CheckpointImageRepo, "/") {
+		parts := strings.SplitN(spotInstanceJob.Spec.CheckpointConfig.CheckpointImageRepo, "/", 2)
+		if len(parts) == 2 {
+			// Check if first part is a registry (contains dot or common registry names)
+			if strings.Contains(parts[0], ".") || parts[0] == "docker.io" || parts[0] == "gcr.io" || parts[0] == "ghcr.io" || parts[0] == "quay.io" {
+				registryURL = parts[0]
+			}
+		}
+	}
+
 	// Create a map of container name -> checkpoint image
 	checkpointImageMap := make(map[string]string)
 	if len(checkpointContainers) > 0 {
 		for _, c := range checkpointContainers {
 			if name, ok := c["name"].(string); ok {
 				if image, ok := c["image"].(string); ok {
-					checkpointImageMap[name] = image
+					checkpointImageMap[name] = registryURL + "/" + image
 				}
 			}
 		}

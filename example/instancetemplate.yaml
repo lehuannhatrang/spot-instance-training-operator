@@ -3,7 +3,7 @@ kind: InstanceTemplate
 metadata:
   name: testla-t4-1-gpu
 spec:
-  vmImage: "projects/criu-with-gpu-dcn/global/images/image-ubuntu-2404-gpu-580-v5"
+  vmImage: "projects/criu-with-gpu-dcn/global/images/image-ubuntu-2404-gpu-580-v6"
   gpu:
     type: "nvidia-tesla-t4"
     count: 1

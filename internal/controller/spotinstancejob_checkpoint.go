@@ -496,7 +496,7 @@ func (r *SpotInstanceJobReconciler) createCheckpointForJob(ctx context.Context, 
 	containers := []map[string]interface{}{}
 	for _, container := range pod.Spec.Containers {
 		// Format: {imageRepo}:{container_name}-{timestamp}
-		checkpointImage := fmt.Sprintf("%s:%s-%d", imageRepo, container.Name, timestamp)
+		checkpointImage := fmt.Sprintf("%s:%s-%d", repository, container.Name, timestamp)
 		containers = append(containers, map[string]interface{}{
 			"name":  container.Name,
 			"image": checkpointImage,
